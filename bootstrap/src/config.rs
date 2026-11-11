@@ -168,6 +168,15 @@ pub struct DirectoryConfig {
     /// Output directory (where artifacts are placed).
     #[serde(default = "default_output_dir")]
     pub output: PathBuf,
+    /// Toolchain directory (where toolchain binaries are installed).
+    #[serde(default = "default_toolchain_dir")]
+    pub toolchain: PathBuf,
+    /// Sysroot directory (where target sysroot is installed).
+    #[serde(default = "default_sysroot_dir")]
+    pub sysroot: PathBuf,
+    /// Logs directory (where build logs are stored).
+    #[serde(default = "default_logs_dir")]
+    pub logs: PathBuf,
 }
 
 fn default_workspace_dir() -> PathBuf {
@@ -186,6 +195,18 @@ fn default_output_dir() -> PathBuf {
     PathBuf::from("workspace/output")
 }
 
+fn default_toolchain_dir() -> PathBuf {
+    PathBuf::from("workspace/toolchain")
+}
+
+fn default_sysroot_dir() -> PathBuf {
+    PathBuf::from("workspace/sysroot")
+}
+
+fn default_logs_dir() -> PathBuf {
+    PathBuf::from("workspace/logs")
+}
+
 impl Default for DirectoryConfig {
     fn default() -> Self {
         Self {
@@ -193,6 +214,9 @@ impl Default for DirectoryConfig {
             source: default_source_dir(),
             build: default_build_dir(),
             output: default_output_dir(),
+            toolchain: default_toolchain_dir(),
+            sysroot: default_sysroot_dir(),
+            logs: default_logs_dir(),
         }
     }
 }
@@ -204,6 +228,9 @@ impl DirectoryConfig {
         self.source = resolve_relative_path(config_dir, &self.source);
         self.build = resolve_relative_path(config_dir, &self.build);
         self.output = resolve_relative_path(config_dir, &self.output);
+        self.toolchain = resolve_relative_path(config_dir, &self.toolchain);
+        self.sysroot = resolve_relative_path(config_dir, &self.sysroot);
+        self.logs = resolve_relative_path(config_dir, &self.logs);
     }
 }
 
@@ -355,13 +382,37 @@ fn validate_config(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Resolves a path relative to a base directory.
+/// Resolves a path relative to a base directory and normalizes the result.
 fn resolve_relative_path(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let resolved = if path.is_absolute() {
         path.to_path_buf()
     } else {
         base.join(path)
+    };
+    normalize_path(&resolved)
+}
+
+/// Normalizes a path by resolving `..` and `.` components without requiring the path to exist.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !components.is_empty() {
+                    components.pop();
+                } else {
+                    components.push(component);
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => components.push(other),
+        }
     }
+    let mut normalized = PathBuf::new();
+    for component in components {
+        normalized.push(component);
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -437,6 +488,9 @@ mod tests {
             source: PathBuf::from("workspace/sources"),
             build: PathBuf::from("workspace/build"),
             output: PathBuf::from("workspace/output"),
+            toolchain: PathBuf::from("workspace/toolchain"),
+            sysroot: PathBuf::from("workspace/sysroot"),
+            logs: PathBuf::from("workspace/logs"),
         };
 
         dirs.resolve_paths(config_dir);
@@ -445,6 +499,9 @@ mod tests {
         assert_eq!(dirs.source, config_dir.join("workspace/sources"));
         assert_eq!(dirs.build, config_dir.join("workspace/build"));
         assert_eq!(dirs.output, config_dir.join("workspace/output"));
+        assert_eq!(dirs.toolchain, config_dir.join("workspace/toolchain"));
+        assert_eq!(dirs.sysroot, config_dir.join("workspace/sysroot"));
+        assert_eq!(dirs.logs, config_dir.join("workspace/logs"));
     }
 
     #[test]
@@ -457,6 +514,9 @@ mod tests {
             source: PathBuf::from("/absolute/sources"),
             build: PathBuf::from("/absolute/build"),
             output: PathBuf::from("/absolute/output"),
+            toolchain: PathBuf::from("/absolute/toolchain"),
+            sysroot: PathBuf::from("/absolute/sysroot"),
+            logs: PathBuf::from("/absolute/logs"),
         };
 
         dirs.resolve_paths(config_dir);
@@ -465,6 +525,9 @@ mod tests {
         assert_eq!(dirs.source, PathBuf::from("/absolute/sources"));
         assert_eq!(dirs.build, PathBuf::from("/absolute/build"));
         assert_eq!(dirs.output, PathBuf::from("/absolute/output"));
+        assert_eq!(dirs.toolchain, PathBuf::from("/absolute/toolchain"));
+        assert_eq!(dirs.sysroot, PathBuf::from("/absolute/sysroot"));
+        assert_eq!(dirs.logs, PathBuf::from("/absolute/logs"));
     }
 
     #[test]

@@ -167,6 +167,9 @@ fn show_config(config_path: &PathBuf) {
             println!("source = \"{}\"", config.directories.source.display());
             println!("build = \"{}\"", config.directories.build.display());
             println!("output = \"{}\"", config.directories.output.display());
+            println!("toolchain = \"{}\"", config.directories.toolchain.display());
+            println!("sysroot = \"{}\"", config.directories.sysroot.display());
+            println!("logs = \"{}\"", config.directories.logs.display());
             println!();
 
             println!("[build]");

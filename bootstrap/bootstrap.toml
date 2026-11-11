@@ -28,16 +28,25 @@ arch = "x86_64"
 # Directory configuration (all paths relative to this config file)
 [directories]
 # Workspace root directory (default: "workspace")
-workspace = "workspace"
+workspace = "../.."
 
 # Source directory for fetched/extracted sources (default: "workspace/sources")
-source = "workspace/sources"
+source = "../../sources"
 
 # Build directory for compilation (default: "workspace/build")
-build = "workspace/build"
+build = "../../build"
 
 # Output directory for artifacts (default: "workspace/output")
-output = "workspace/output"
+output = "../../output"
+
+# Toolchain directory for toolchain binaries (default: "workspace/toolchain")
+toolchain = "../../toolchain"
+
+# Sysroot directory for target sysroot (default: "workspace/sysroot")
+sysroot = "../../sysroot"
+
+# Logs directory for build logs (default: "workspace/logs")
+logs = "../../logs"
 
 # Build configuration
 [build]
