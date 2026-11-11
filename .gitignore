@@ -1,1 +1,4 @@
 .freebuff/
+# Rust build artifacts
+target/
+**/target/

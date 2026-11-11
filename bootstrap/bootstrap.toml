@@ -1,0 +1,64 @@
+# Royal Linux Bootstrap Configuration
+#
+# This file configures the bootstrap build system. All paths are relative to
+# this configuration file's location unless they are absolute.
+#
+# Lines starting with # are comments.
+
+# Host system information (optional - detected at load time if not specified)
+[host]
+# arch = "x86_64"      # Host architecture (x86_64, aarch64)
+# os = "linux"         # Host operating system
+# vendor = "unknown"   # Host vendor
+
+# Target system configuration
+[target]
+# Target architecture (required): x86_64 or aarch64
+arch = "x86_64"
+
+# Target vendor (default: "unknown")
+# vendor = "unknown"
+
+# Target operating system (default: "linux")
+# os = "linux"
+
+# Target ABI (default: "gnu")
+# abi = "gnu"
+
+# Directory configuration (all paths relative to this config file)
+[directories]
+# Workspace root directory (default: "workspace")
+workspace = "workspace"
+
+# Source directory for fetched/extracted sources (default: "workspace/sources")
+source = "workspace/sources"
+
+# Build directory for compilation (default: "workspace/build")
+build = "workspace/build"
+
+# Output directory for artifacts (default: "workspace/output")
+output = "workspace/output"
+
+# Build configuration
+[build]
+# Number of parallel jobs (default: number of CPU cores)
+# jobs = 4
+
+# Enable verbose output (default: false)
+# verbose = false
+
+# Keep build artifacts on failure (default: false)
+# keep_on_failure = false
+
+# Build optimization level (default: "2")
+# Valid values: "0", "1", "2", "3", "s", "z"
+# opt_level = "2"
+
+# Additional C compiler flags
+# cflags = ["-pipe", "-fomit-frame-pointer"]
+
+# Additional C++ compiler flags
+# cxxflags = ["-pipe", "-fomit-frame-pointer"]
+
+# Additional linker flags
+# ldflags = ["-Wl,-O1", "-Wl,--as-needed"]
