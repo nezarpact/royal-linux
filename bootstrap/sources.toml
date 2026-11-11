@@ -1,0 +1,13 @@
+# Royal Linux Source Definitions
+#
+# This file defines the source packages needed to build the Royal Linux system.
+# Each entry contains:
+#   name        - Package identifier (must match the key)
+#   version     - Package version
+#   url         - Download URL (HTTP or HTTPS)
+#   sha256      - Expected SHA-256 checksum (64 hex characters)
+#   archive     - Filename to save as (no path separators allowed)
+#
+# Add source definitions here when building the distribution.
+# Example:
+# zlib = { name = "zlib", version = "1.3.1", url = "https://zlib.net/current/zlib-1.3.1.tar.gz", sha256 = "9a93d2b2f0f0e3e8b8b9c6f6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6", archive = "zlib-1.3.1.tar.gz" }
