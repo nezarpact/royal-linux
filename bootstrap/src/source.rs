@@ -200,21 +200,11 @@ impl SourceManager {
         Ok(())
     }
 
-    /// Returns a reference to a source definition by name.
-    pub fn get_source(&self, name: &str) -> Option<&SourceDefinition> {
-        self.sources.get(name)
-    }
-
     /// Returns all loaded source definitions, sorted deterministically by name.
     pub fn list_sources(&self) -> Vec<&SourceDefinition> {
         let mut sources: Vec<&SourceDefinition> = self.sources.values().collect();
         sources.sort_by(|a, b| a.name.cmp(&b.name));
         sources
-    }
-
-    /// Returns the source directory path.
-    pub fn source_dir(&self) -> &Path {
-        &self.config.directories.source
     }
 
     /// Returns the cache directory path (same as source directory for now).
@@ -1151,7 +1141,7 @@ arch = "x86_64"
         #[test]
         fn test_list_sources_deterministic() {
             let content = b"test";
-            let (server, url, sha256) = setup_test_server(content);
+            let (_server, url, sha256) = setup_test_server(content);
 
             let config = create_test_config();
             let mut manager = SourceManager::new(config).unwrap();

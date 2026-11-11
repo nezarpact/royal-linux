@@ -46,9 +46,6 @@ pub enum SourceError {
 
     #[error("Incomplete download: expected {expected} bytes, got {actual} bytes")]
     IncompleteDownload { expected: u64, actual: u64 },
-
-    #[error("Temporary file cleanup failed: {0}")]
-    TempCleanupFailed(String),
 }
 
 impl From<reqwest::Error> for SourceError {
@@ -70,5 +67,4 @@ impl From<hex::FromHexError> for SourceError {
     }
 }
 
-pub type Result<T> = std::result::Result<T, BootstrapError>;
 pub type SourceResult<T> = std::result::Result<T, SourceError>;
