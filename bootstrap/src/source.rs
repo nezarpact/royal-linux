@@ -315,14 +315,14 @@ impl SourceManager {
         }
 
         // Verify content length if provided
-        if let Some(expected) = expected_len {
-            if downloaded != expected {
-                self.cleanup_temp_file(temp_path);
-                return Err(SourceError::IncompleteDownload {
-                    expected,
-                    actual: downloaded,
-                });
-            }
+        if let Some(expected) = expected_len
+            && downloaded != expected
+        {
+            self.cleanup_temp_file(temp_path);
+            return Err(SourceError::IncompleteDownload {
+                expected,
+                actual: downloaded,
+            });
         }
 
         Ok(())
@@ -391,6 +391,7 @@ impl SourceManager {
 }
 
 /// Loads source definitions from a TOML file.
+#[allow(dead_code)]
 pub fn load_sources<P: AsRef<Path>>(path: P) -> SourceResult<HashMap<String, SourceDefinition>> {
     let content = fs::read_to_string(&path).map_err(|e| {
         SourceError::InvalidDefinition(format!(
@@ -855,7 +856,7 @@ arch = "x86_64"
             let mock = server.mock(|when, then| {
                 when.method(GET).path("/test.tar.gz");
                 then.status(200)
-                    .header("content-length", &content.len().to_string())
+                    .header("content-length", content.len().to_string())
                     .body(content);
             });
 

@@ -72,6 +72,18 @@ impl ExtractManager {
         Ok(())
     }
 
+    /// Returns a reference to the loaded source definitions.
+    pub fn sources(&self) -> &HashMap<String, SourceDefinition> {
+        &self.sources
+    }
+
+    /// Computes the expected extraction path for a source definition.
+    /// Uses package name and version for predictable naming.
+    pub fn extract_path(&self, def: &SourceDefinition) -> PathBuf {
+        self.build_dir()
+            .join(format!("{}-{}", def.name, def.version))
+    }
+
     /// Returns the source directory path.
     fn source_dir(&self) -> &Path {
         &self.config.directories.source
@@ -80,13 +92,6 @@ impl ExtractManager {
     /// Returns the build directory path (where sources are extracted).
     fn build_dir(&self) -> &Path {
         &self.config.directories.build
-    }
-
-    /// Computes the expected extraction path for a source definition.
-    /// Uses package name and version for predictable naming.
-    fn extract_path(&self, def: &SourceDefinition) -> PathBuf {
-        self.build_dir()
-            .join(format!("{}-{}", def.name, def.version))
     }
 
     /// Computes the cache marker path for a source definition.

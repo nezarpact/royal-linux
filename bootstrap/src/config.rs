@@ -54,7 +54,7 @@ impl std::fmt::Display for Architecture {
 }
 
 /// Host system information (configured by user; detection runs at load time if not specified).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HostConfig {
     /// Host architecture (detected at load time if not specified).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,16 +65,6 @@ pub struct HostConfig {
     /// Host vendor (detected at load time if not specified).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
-}
-
-impl Default for HostConfig {
-    fn default() -> Self {
-        Self {
-            arch: None,
-            os: None,
-            vendor: None,
-        }
-    }
 }
 
 impl HostConfig {
@@ -177,6 +167,9 @@ pub struct DirectoryConfig {
     /// Logs directory (where build logs are stored).
     #[serde(default = "default_logs_dir")]
     pub logs: PathBuf,
+    /// Staging directory (where packages are installed before publishing to sysroot).
+    #[serde(default = "default_staging_dir")]
+    pub staging: PathBuf,
 }
 
 fn default_workspace_dir() -> PathBuf {
@@ -207,6 +200,10 @@ fn default_logs_dir() -> PathBuf {
     PathBuf::from("workspace/logs")
 }
 
+fn default_staging_dir() -> PathBuf {
+    PathBuf::from("workspace/staging")
+}
+
 impl Default for DirectoryConfig {
     fn default() -> Self {
         Self {
@@ -217,6 +214,7 @@ impl Default for DirectoryConfig {
             toolchain: default_toolchain_dir(),
             sysroot: default_sysroot_dir(),
             logs: default_logs_dir(),
+            staging: default_staging_dir(),
         }
     }
 }
@@ -231,6 +229,7 @@ impl DirectoryConfig {
         self.toolchain = resolve_relative_path(config_dir, &self.toolchain);
         self.sysroot = resolve_relative_path(config_dir, &self.sysroot);
         self.logs = resolve_relative_path(config_dir, &self.logs);
+        self.staging = resolve_relative_path(config_dir, &self.staging);
     }
 }
 
@@ -279,7 +278,7 @@ impl Default for BuildConfig {
 }
 
 /// Complete bootstrap configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Host system information.
     #[serde(default)]
@@ -293,17 +292,6 @@ pub struct Config {
     /// Build configuration.
     #[serde(default)]
     pub build: BuildConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            host: HostConfig::default(),
-            target: TargetConfig::default(),
-            directories: DirectoryConfig::default(),
-            build: BuildConfig::default(),
-        }
-    }
 }
 
 /// Configuration errors.
@@ -347,22 +335,22 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
 /// Validates the configuration.
 fn validate_config(config: &Config) -> Result<(), ConfigError> {
     // Validate workspace directory parent exists
-    if let Some(parent) = config.directories.workspace.parent() {
-        if !parent.exists() {
-            return Err(ConfigError::Validation(format!(
-                "Workspace directory parent does not exist: {}",
-                parent.display()
-            )));
-        }
+    if let Some(parent) = config.directories.workspace.parent()
+        && !parent.exists()
+    {
+        return Err(ConfigError::Validation(format!(
+            "Workspace directory parent does not exist: {}",
+            parent.display()
+        )));
     }
 
     // Validate jobs setting
-    if let Some(jobs) = config.build.jobs {
-        if jobs == 0 {
-            return Err(ConfigError::Validation(
-                "jobs must be greater than 0".to_string(),
-            ));
-        }
+    if let Some(jobs) = config.build.jobs
+        && jobs == 0
+    {
+        return Err(ConfigError::Validation(
+            "jobs must be greater than 0".to_string(),
+        ));
     }
 
     // Validate opt_level
@@ -491,6 +479,7 @@ mod tests {
             toolchain: PathBuf::from("workspace/toolchain"),
             sysroot: PathBuf::from("workspace/sysroot"),
             logs: PathBuf::from("workspace/logs"),
+            staging: PathBuf::from("workspace/staging"),
         };
 
         dirs.resolve_paths(config_dir);
@@ -517,6 +506,7 @@ mod tests {
             toolchain: PathBuf::from("/absolute/toolchain"),
             sysroot: PathBuf::from("/absolute/sysroot"),
             logs: PathBuf::from("/absolute/logs"),
+            staging: PathBuf::from("/absolute/staging"),
         };
 
         dirs.resolve_paths(config_dir);

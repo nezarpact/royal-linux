@@ -1,0 +1,395 @@
+# Royal Linux Build Recipes
+#
+# This file defines the build recipes for packages. Each recipe specifies:
+#   name        - Package name (must match the key)
+#   version     - Package version
+#   source      - Source key from sources.toml (must exist)
+#   depends     - Optional list of package names this recipe depends on
+#   build       - Build steps (array of objects with command and args)
+#   install     - Installation steps (array of objects with command and args)
+#   env         - Optional environment variables for build
+#   workdir     - Optional working directory relative to extracted source
+#
+# IMPORTANT: These recipes are EXAMPLE/TEMPLATE definitions for the Royal Linux
+# bootstrap toolchain. They reference source packages defined in sources.toml
+# which currently contain PLACEHOLDER checksums (sha256 = "REPLACE_WITH_ACTUAL_SHA256_CHECKSUM").
+#
+# Before using these recipes for actual builds:
+#   1. Obtain real SHA-256 checksums for all source tarballs in sources.toml
+#   2. Verify all URLs are accessible and point to the correct versions
+#   3. Test each recipe's build and install steps in a clean environment
+#   4. Adjust build flags, dependencies, and steps as needed for your target
+#
+# These recipes represent a typical Linux-from-scratch style toolchain and base
+# system. They are not guaranteed to build correctly without testing and
+# adjustment for your specific architecture and requirements.
+#
+# Add recipes here when building the distribution.
+
+[zlib]
+name = "zlib"
+version = "1.4"
+source = "zlib"
+depends = []
+build = [
+  { command = "./configure", args = ["--prefix=/usr"], description = "Configure zlib" },
+  { command = "make", args = [], description = "Build zlib" },
+  { command = "make", args = ["test"], description = "Test zlib" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install zlib" },
+]
+workdir = "."
+
+[openssl]
+name = "openssl"
+version = "3.5.0"
+source = "openssl"
+depends = ["zlib"]
+build = [
+  { command = "./Configure", args = ["linux-x86_64", "--prefix=/usr", "--openssldir=/etc/ssl", "--libdir=lib", "shared", "zlib-dynamic"], description = "Configure OpenSSL" },
+  { command = "make", args = [], description = "Build OpenSSL" },
+  { command = "make", args = ["test"], description = "Test OpenSSL" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install OpenSSL" },
+]
+workdir = "."
+env = { "KERNEL_BITS" = "64" }
+
+[binutils]
+name = "binutils"
+version = "2.43.1"
+source = "binutils"
+depends = ["zlib"]
+build = [
+  { command = "../configure", args = ["--prefix=/usr", "--with-sysroot", "--enable-gold=default", "--enable-ld=default", "--enable-plugins", "--enable-shared", "--disable-werror", "--enable-64-bit-bfd", "--with-system-zlib"], description = "Configure binutils", workdir = "build" },
+  { command = "make", args = ["tooldir=/usr"], description = "Build binutils", workdir = "build" },
+]
+install = [
+  { command = "make", args = ["install", "tooldir=/usr"], description = "Install binutils", workdir = "build" },
+]
+workdir = "."
+
+[gcc]
+name = "gcc"
+version = "14.2.0"
+source = "gcc"
+depends = ["binutils", "zlib", "gmp", "mpfr", "mpc"]
+build = [
+  { command = "../configure", args = ["--prefix=/usr", "--disable-multilib", "--enable-languages=c,c++", "--with-system-zlib", "--enable-shared", "--enable-threads=posix", "--enable-__cxa_atexit", "--disable-libunwind-exceptions", "--enable-clocale=gnu", "--disable-libstdcxx-pch", "--with-default-libstdcxx-abi=new", "--enable-gnu-unique-object", "--enable-linker-build-id", "--enable-lto", "--enable-plugin", "--enable-install-libiberty", "--with-linker-hash-style=gnu", "--enable-gnu-indirect-function", "--disable-werror", "--enable-checking=release"], description = "Configure GCC", workdir = "build" },
+  { command = "make", args = [], description = "Build GCC", workdir = "build" },
+  { command = "make", args = ["-k", "check"], description = "Test GCC", workdir = "build" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install GCC", workdir = "build" },
+  { command = "ln", args = ["-sv", "gcc", "${DESTDIR}/usr/bin/cc"], description = "Create cc symlink" },
+]
+workdir = "."
+
+[gmp]
+name = "gmp"
+version = "6.3.0"
+source = "gmp"
+depends = []
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--enable-cxx", "--enable-fat"], description = "Configure GMP" },
+  { command = "make", args = [], description = "Build GMP" },
+  { command = "make", args = ["check"], description = "Test GMP" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install GMP" },
+]
+workdir = "."
+
+[mpfr]
+name = "mpfr"
+version = "4.2.1"
+source = "mpfr"
+depends = ["gmp"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--enable-thread-safe", "--with-gmp=/usr"], description = "Configure MPFR" },
+  { command = "make", args = [], description = "Build MPFR" },
+  { command = "make", args = ["check"], description = "Test MPFR" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install MPFR" },
+]
+workdir = "."
+
+[mpc]
+name = "mpc"
+version = "1.3.1"
+source = "mpc"
+depends = ["gmp", "mpfr"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--with-gmp=/usr", "--with-mpfr=/usr"], description = "Configure MPC" },
+  { command = "make", args = [], description = "Build MPC" },
+  { command = "make", args = ["check"], description = "Test MPC" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install MPC" },
+]
+workdir = "."
+
+[glibc]
+name = "glibc"
+version = "2.40"
+source = "glibc"
+depends = ["gcc", "binutils", "linux-headers"]
+build = [
+  { command = "../configure", args = ["--prefix=/usr", "--disable-werror", "--enable-kernel=5.4", "--enable-stack-protector=strong", "--with-headers=/usr/include", "--enable-bind-now", "--disable-profile", "--enable-add-ons", "--enable-lock-elision"], description = "Configure glibc", workdir = "build" },
+  { command = "make", args = [], description = "Build glibc", workdir = "build" },
+]
+install = [
+  { command = "make", args = ["install", "install_root=${DESTDIR}"], description = "Install glibc", workdir = "build" },
+  { command = "mkdir", args = ["-p", "${DESTDIR}/etc"], description = "Create etc directory" },
+  { command = "cp", args = ["../nscd/nscd.conf", "${DESTDIR}/etc/nscd.conf"], description = "Install nscd config" },
+  { command = "mkdir", args = ["-p", "${DESTDIR}/var/cache/nscd"], description = "Create nscd cache directory" },
+]
+workdir = "."
+
+[linux-headers]
+name = "linux-headers"
+version = "6.10.0"
+source = "linux-headers"
+depends = []
+build = [
+  { command = "make", args = ["mrproper"], description = "Clean kernel source" },
+  { command = "make", args = ["headers"], description = "Build kernel headers" },
+]
+install = [
+  { command = "make", args = ["headers_install", "INSTALL_HDR_PATH=${DESTDIR}/usr"], description = "Install kernel headers" },
+  { command = "find", args = ["${DESTDIR}/usr/include", "-type", "f", "-name", "*.h", "-exec", "chmod", "644", "{}", ";"], description = "Fix header permissions" },
+]
+workdir = "."
+
+[make]
+name = "make"
+version = "4.4.1"
+source = "make"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr"], description = "Configure make" },
+  { command = "make", args = [], description = "Build make" },
+  { command = "make", args = ["check"], description = "Test make" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install make" },
+]
+workdir = "."
+
+[bash]
+name = "bash"
+version = "5.2.32"
+source = "bash"
+depends = ["glibc", "readline", "ncurses"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--without-bash-malloc", "--with-installed-readline"], description = "Configure bash" },
+  { command = "make", args = [], description = "Build bash" },
+  { command = "make", args = ["check"], description = "Test bash" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install bash" },
+  { command = "ln", args = ["-sv", "bash", "${DESTDIR}/usr/bin/sh"], description = "Create sh symlink" },
+]
+workdir = "."
+
+[readline]
+name = "readline"
+version = "8.2"
+source = "readline"
+depends = ["glibc", "ncurses"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--disable-static", "--with-curses"], description = "Configure readline" },
+  { command = "make", args = ["SHLIB_LIBS=-lncursesw"], description = "Build readline" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install readline" },
+]
+workdir = "."
+
+[ncurses]
+name = "ncurses"
+version = "6.5"
+source = "ncurses"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--with-shared", "--without-debug", "--without-normal", "--enable-pc-files", "--enable-widec", "--with-pkg-config-libdir=/usr/lib/pkgconfig"], description = "Configure ncurses" },
+  { command = "make", args = [], description = "Build ncurses" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install ncurses" },
+  { command = "ln", args = ["-svf", "libncursesw.so", "${DESTDIR}/usr/lib/libncurses.so"], description = "Create libncurses symlink" },
+  { command = "ln", args = ["-svf", "libformw.so", "${DESTDIR}/usr/lib/libform.so"], description = "Create libform symlink" },
+  { command = "ln", args = ["-svf", "libpanelw.so", "${DESTDIR}/usr/lib/libpanel.so"], description = "Create libpanel symlink" },
+  { command = "ln", args = ["-svf", "libmenuw.so", "${DESTDIR}/usr/lib/libmenu.so"], description = "Create libmenu symlink" },
+  { command = "ln", args = ["-svf", "libncursesw.so", "${DESTDIR}/usr/lib/libcurses.so"], description = "Create libcurses symlink" },
+]
+workdir = "."
+
+[coreutils]
+name = "coreutils"
+version = "9.6"
+source = "coreutils"
+depends = ["glibc", "gmp", "openssl"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--enable-no-install-program=kill,uptime"], description = "Configure coreutils" },
+  { command = "make", args = [], description = "Build coreutils" },
+  { command = "make", args = ["check"], description = "Test coreutils" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install coreutils" },
+]
+workdir = "."
+
+[diffutils]
+name = "diffutils"
+version = "3.11"
+source = "diffutils"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr"], description = "Configure diffutils" },
+  { command = "make", args = [], description = "Build diffutils" },
+  { command = "make", args = ["check"], description = "Test diffutils" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install diffutils" },
+]
+workdir = "."
+
+[file]
+name = "file"
+version = "5.45"
+source = "file"
+depends = ["glibc", "zlib"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr"], description = "Configure file" },
+  { command = "make", args = [], description = "Build file" },
+  { command = "make", args = ["check"], description = "Test file" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install file" },
+]
+workdir = "."
+
+[findutils]
+name = "findutils"
+version = "4.10.0"
+source = "findutils"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr"], description = "Configure findutils" },
+  { command = "make", args = [], description = "Build findutils" },
+  { command = "make", args = ["check"], description = "Test findutils" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install findutils" },
+]
+workdir = "."
+
+[grep]
+name = "grep"
+version = "3.11"
+source = "grep"
+depends = ["glibc", "pcre"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--bindir=/usr/bin"], description = "Configure grep" },
+  { command = "make", args = [], description = "Build grep" },
+  { command = "make", args = ["check"], description = "Test grep" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install grep" },
+]
+workdir = "."
+
+[pcre]
+name = "pcre"
+version = "8.45"
+source = "pcre"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--enable-unicode-properties", "--enable-pcre16", "--enable-pcre32", "--enable-pcregrep-libz", "--enable-pcregrep-libbz2", "--enable-jit", "--with-match-limit=10000000", "--with-match-limit-recursion=10000000"], description = "Configure PCRE" },
+  { command = "make", args = [], description = "Build PCRE" },
+  { command = "make", args = ["check"], description = "Test PCRE" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install PCRE" },
+]
+workdir = "."
+
+[gawk]
+name = "gawk"
+version = "5.3.1"
+source = "gawk"
+depends = ["glibc", "mpfr", "gmp", "mpc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr"], description = "Configure gawk" },
+  { command = "make", args = [], description = "Build gawk" },
+  { command = "make", args = ["check"], description = "Test gawk" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install gawk" },
+]
+workdir = "."
+
+[sed]
+name = "sed"
+version = "4.9"
+source = "sed"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr"], description = "Configure sed" },
+  { command = "make", args = [], description = "Build sed" },
+  { command = "make", args = ["check"], description = "Test sed" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install sed" },
+]
+workdir = "."
+
+[tar]
+name = "tar"
+version = "1.35"
+source = "tar"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr"], description = "Configure tar" },
+  { command = "make", args = [], description = "Build tar" },
+  { command = "make", args = ["check"], description = "Test tar" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install tar" },
+]
+workdir = "."
+
+[xz]
+name = "xz"
+version = "5.6.2"
+source = "xz"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--disable-static", "--docdir=/usr/share/doc/xz-5.6.2"], description = "Configure xz" },
+  { command = "make", args = [], description = "Build xz" },
+  { command = "make", args = ["check"], description = "Test xz" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install xz" },
+]
+workdir = "."
+
+[pkgconf]
+name = "pkgconf"
+version = "2.3.0"
+source = "pkgconf"
+depends = ["glibc"]
+build = [
+  { command = "./configure", args = ["--prefix=/usr", "--disable-static"], description = "Configure pkgconf" },
+  { command = "make", args = [], description = "Build pkgconf" },
+  { command = "make", args = ["check"], description = "Test pkgconf" },
+]
+install = [
+  { command = "make", args = ["install"], description = "Install pkgconf" },
+  { command = "ln", args = ["-sv", "pkgconf", "${DESTDIR}/usr/bin/pkg-config"], description = "Create pkg-config symlink" },
+]
+workdir = "."
