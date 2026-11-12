@@ -56,7 +56,7 @@ impl ExtractManager {
             ExtractError::ExtractionFailed(format!("failed to parse sources TOML: {}", e))
         })?;
 
-        // Validate each source definition
+        // Validate that source key matches definition name
         for (name, def) in &sources {
             if name != &def.name {
                 return Err(ExtractError::ExtractionFailed(format!(
@@ -64,8 +64,6 @@ impl ExtractManager {
                     name, def.name
                 )));
             }
-            def.validate()
-                .map_err(|e| ExtractError::ExtractionFailed(e.to_string()))?;
         }
 
         self.sources = sources;
@@ -2102,5 +2100,61 @@ logs = "workspace/logs"
             // Owner should have execute permission
             assert!(mode & 0o100 != 0, "File should be executable");
         }
+    }
+
+    #[test]
+    fn test_load_sources_succeeds_with_placeholder_checksums() {
+        // Regression test: load_sources should succeed even when some sources have
+        // placeholder/invalid checksums, because validation is deferred to extract().
+        let temp_dir = tempdir().unwrap();
+        let sources_path = temp_dir.path().join("sources.toml");
+        let content = r#"
+zlib = { name = "zlib", version = "1.3.1", url = "https://example.com/zlib.tar.gz", sha256 = "0000000000000000000000000000000000000000000000000000000000000000", archive = "zlib.tar.gz" }
+openssl = { name = "openssl", version = "3.0.0", url = "https://example.com/openssl.tar.gz", sha256 = "REPLACE_WITH_ACTUAL_SHA256_CHECKSUM", archive = "openssl.tar.gz" }
+gcc = { name = "gcc", version = "13.0.0", url = "https://example.com/gcc.tar.gz", sha256 = "not_a_valid_sha256", archive = "gcc.tar.gz" }
+"#;
+        fs::write(&sources_path, content).unwrap();
+
+        let config = create_test_config();
+        let mut manager = ExtractManager::new(config);
+        // load_sources should succeed - it only validates name/key matching, not checksums
+        manager.load_sources(&sources_path).unwrap();
+
+        let sources = manager.sources();
+        assert_eq!(sources.len(), 3);
+        assert!(sources.contains_key("zlib"));
+        assert!(sources.contains_key("openssl"));
+        assert!(sources.contains_key("gcc"));
+    }
+
+    #[test]
+    fn test_extract_fails_on_invalid_checksum() {
+        // Regression test: extracting a source with an invalid checksum should fail
+        let temp_dir = tempdir().unwrap();
+        let sources_path = temp_dir.path().join("sources.toml");
+        let content = r#"
+zlib = { name = "zlib", version = "1.3.1", url = "https://example.com/zlib.tar.gz", sha256 = "0000000000000000000000000000000000000000000000000000000000000000", archive = "zlib.tar.gz" }
+openssl = { name = "openssl", version = "3.0.0", url = "https://example.com/openssl.tar.gz", sha256 = "REPLACE_WITH_ACTUAL_SHA256_CHECKSUM", archive = "openssl.tar.gz" }
+"#;
+        fs::write(&sources_path, content).unwrap();
+
+        let config = create_test_config();
+        let mut manager = ExtractManager::new(config);
+        manager.load_sources(&sources_path).unwrap();
+
+        // Extracting openssl (with placeholder) should fail validation
+        let result = manager.extract("openssl", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SHA-256 must be 64 hex characters, got 35"));
+
+        // Extracting zlib (with valid checksum format) should pass validation
+        // (will fail on missing archive, but validation passes)
+        let result = manager.extract("zlib", false);
+        // zlib has valid checksum format but no archive - should fail on missing file, not validation
+        assert!(result.is_err());
+        // The error should be about missing file, not about checksum validation
+        let err = result.unwrap_err().to_string();
+        assert!(!err.contains("SHA-256 must be 64 hex characters"));
     }
 }
