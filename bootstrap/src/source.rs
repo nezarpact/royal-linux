@@ -185,7 +185,7 @@ impl SourceManager {
             SourceError::InvalidDefinition(format!("failed to parse sources TOML: {}", e))
         })?;
 
-        // Validate each source definition
+        // Validate that source key matches definition name
         for (name, def) in &sources {
             if name != &def.name {
                 return Err(SourceError::InvalidDefinition(format!(
@@ -193,7 +193,6 @@ impl SourceManager {
                     name, def.name
                 )));
             }
-            def.validate()?;
         }
 
         self.sources = sources;
@@ -336,6 +335,9 @@ impl SourceManager {
             .ok_or_else(|| SourceError::NotFound(format!("source '{}' not found", name)))?
             .clone();
 
+        // Validate the source definition before use
+        def.validate()?;
+
         // Check cache first (unless forced)
         if !force && self.check_cache(&def) {
             return Ok(FetchResult {
@@ -405,7 +407,7 @@ pub fn load_sources<P: AsRef<Path>>(path: P) -> SourceResult<HashMap<String, Sou
         SourceError::InvalidDefinition(format!("failed to parse sources TOML: {}", e))
     })?;
 
-    // Validate each source definition
+    // Validate that source key matches definition name
     for (name, def) in &sources {
         if name != &def.name {
             return Err(SourceError::InvalidDefinition(format!(
@@ -413,7 +415,6 @@ pub fn load_sources<P: AsRef<Path>>(path: P) -> SourceResult<HashMap<String, Sou
                 name, def.name
             )));
         }
-        def.validate()?;
     }
 
     Ok(sources)
@@ -673,6 +674,65 @@ zlib = {{ name = "zlib", version = "1.3.1", url = "https://example.com/zlib.tar.
         let sources = load_sources(&sources_path).unwrap();
         assert_eq!(sources.len(), 1);
         assert!(sources.contains_key("zlib"));
+    }
+
+    #[test]
+    fn test_load_sources_succeeds_with_placeholder_checksums() {
+        // Regression test: load_sources should succeed even when some sources have
+        // placeholder/invalid checksums, because validation is deferred to fetch/extract.
+        let temp_dir = tempdir().unwrap();
+        let sources_path = temp_dir.path().join("sources.toml");
+        let (_, valid_sha256) = create_test_content();
+        let content = format!(
+            r#"
+zlib = {{ name = "zlib", version = "1.3.1", url = "https://example.com/zlib.tar.gz", sha256 = "{}", archive = "zlib.tar.gz" }}
+openssl = {{ name = "openssl", version = "3.0.0", url = "https://example.com/openssl.tar.gz", sha256 = "REPLACE_WITH_ACTUAL_SHA256_CHECKSUM", archive = "openssl.tar.gz" }}
+gcc = {{ name = "gcc", version = "13.0.0", url = "https://example.com/gcc.tar.gz", sha256 = "not_a_valid_sha256", archive = "gcc.tar.gz" }}
+"#,
+            valid_sha256
+        );
+        fs::write(&sources_path, content).unwrap();
+
+        // load_sources should succeed - it only validates name/key matching, not checksums
+        let sources = load_sources(&sources_path).unwrap();
+        assert_eq!(sources.len(), 3);
+        assert!(sources.contains_key("zlib"));
+        assert!(sources.contains_key("openssl"));
+        assert!(sources.contains_key("gcc"));
+    }
+
+    #[test]
+    fn test_fetch_fails_on_invalid_checksum() {
+        // Regression test: fetching a source with an invalid checksum should fail
+        let temp_dir = tempdir().unwrap();
+        let sources_path = temp_dir.path().join("sources.toml");
+        let (_, valid_sha256) = create_test_content();
+        let content = format!(
+            r#"
+zlib = {{ name = "zlib", version = "1.3.1", url = "https://example.com/zlib.tar.gz", sha256 = "{}", archive = "zlib.tar.gz" }}
+openssl = {{ name = "openssl", version = "3.0.0", url = "https://example.com/openssl.tar.gz", sha256 = "REPLACE_WITH_ACTUAL_SHA256_CHECKSUM", archive = "openssl.tar.gz" }}
+"#,
+            valid_sha256
+        );
+        fs::write(&sources_path, content).unwrap();
+
+        let config = create_test_config();
+        let mut manager = SourceManager::new(config).unwrap();
+        manager.load_sources(&sources_path).unwrap();
+
+        // Fetching the valid source should work (if we mock the download)
+        // But we can't easily test that without a mock server.
+        // Instead, we test that the source definition validation catches the invalid one.
+
+        // Fetching openssl (with placeholder) should fail validation
+        let result = manager.fetch("openssl", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SHA-256 must be 64 hex characters, got 35"));
+
+        // Fetching zlib (with valid checksum) should pass validation
+        // (will fail on download without mock server, but validation passes)
+        let _result = manager.fetch("zlib", false);
     }
 
     #[test]

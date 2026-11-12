@@ -546,6 +546,10 @@ impl ExtractManager {
             .ok_or_else(|| ExtractError::ExtractionFailed(format!("source '{}' not found", name)))?
             .clone();
 
+        // Validate the source definition before use
+        def.validate()
+            .map_err(|e| ExtractError::ExtractionFailed(e.to_string()))?;
+
         let extract_path = self.extract_path(&def);
 
         // Check cache first (unless forced)
