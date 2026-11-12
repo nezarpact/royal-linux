@@ -4,9 +4,11 @@ use std::process::Command;
 
 mod config;
 mod error;
+mod extract;
 mod source;
 use config::load_config;
 use error::BootstrapError;
+use extract::ExtractManager;
 use source::SourceManager;
 
 struct Requirement {
@@ -58,6 +60,7 @@ fn print_usage() {
     eprintln!("  check       Check host prerequisites (default)");
     eprintln!("  config      Show resolved configuration");
     eprintln!("  fetch       Fetch source packages");
+    eprintln!("  extract     Extract source archives");
     eprintln!("  help        Show this help message");
     eprintln!();
     eprintln!("Options:");
@@ -70,11 +73,20 @@ fn print_usage() {
     eprintln!("  --all                  Fetch all sources");
     eprintln!("  --force                Force re-download even if cached");
     eprintln!();
+    eprintln!("Extract options:");
+    eprintln!("  --list                 List available sources");
+    eprintln!("  --all                  Extract all sources");
+    eprintln!("  --force                Force re-extract even if already extracted");
+    eprintln!();
     eprintln!("Examples:");
     eprintln!("  bootstrap fetch zlib");
     eprintln!("  bootstrap fetch --all");
     eprintln!("  bootstrap fetch --list");
     eprintln!("  bootstrap fetch zlib --force");
+    eprintln!("  bootstrap extract zlib");
+    eprintln!("  bootstrap extract --all");
+    eprintln!("  bootstrap extract --list");
+    eprintln!("  bootstrap extract zlib --force");
 }
 
 fn run_prerequisite_check() {
@@ -378,6 +390,171 @@ fn run_fetch(
     std::process::exit(1);
 }
 
+fn run_extract(
+    config_path: &PathBuf,
+    sources_path: &PathBuf,
+    args: &[String],
+) -> Result<(), BootstrapError> {
+    let config = load_config(config_path)?;
+
+    let mut manager = ExtractManager::new(config);
+    manager.load_sources(sources_path)?;
+
+    // Parse extract subcommands
+    let mut list = false;
+    let mut all = false;
+    let mut force = false;
+    let mut package_name = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list" => {
+                if list {
+                    eprintln!("Error: duplicate option --list");
+                    print_usage();
+                    std::process::exit(1);
+                }
+                list = true;
+                i += 1;
+            }
+            "--all" => {
+                if all {
+                    eprintln!("Error: duplicate option --all");
+                    print_usage();
+                    std::process::exit(1);
+                }
+                all = true;
+                i += 1;
+            }
+            "--force" => {
+                if force {
+                    eprintln!("Error: duplicate option --force");
+                    print_usage();
+                    std::process::exit(1);
+                }
+                force = true;
+                i += 1;
+            }
+            arg if !arg.starts_with('-') => {
+                if package_name.is_some() {
+                    eprintln!("Error: only one package name allowed");
+                    print_usage();
+                    std::process::exit(1);
+                }
+                package_name = Some(arg.to_string());
+                i += 1;
+            }
+            _ => {
+                eprintln!("Unknown extract option: {}", args[i]);
+                print_usage();
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Reject conflicting combinations
+    if list && all {
+        eprintln!("Error: --list and --all cannot be used together");
+        print_usage();
+        std::process::exit(1);
+    }
+    if list && force {
+        eprintln!("Error: --list and --force cannot be used together");
+        print_usage();
+        std::process::exit(1);
+    }
+    if list && package_name.is_some() {
+        eprintln!("Error: --list cannot be used with a package name");
+        print_usage();
+        std::process::exit(1);
+    }
+    if all && package_name.is_some() {
+        eprintln!("Error: --all cannot be used with a package name");
+        print_usage();
+        std::process::exit(1);
+    }
+
+    if list {
+        let sources = manager.list_sources();
+        if sources.is_empty() {
+            println!("No sources defined.");
+        } else {
+            println!("Available sources:");
+            for source in sources {
+                println!("  {} {} ({})", source.name, source.version, source.archive);
+            }
+        }
+        return Ok(());
+    }
+
+    if all {
+        let results = manager.extract_all(force);
+        let mut success = 0;
+        let mut failed = 0;
+
+        for result in results {
+            match result {
+                Ok(extract_result) => {
+                    success += 1;
+                    let status = if extract_result.from_cache {
+                        "cached"
+                    } else {
+                        "extracted"
+                    };
+                    println!(
+                        "{} {} {} [{}]",
+                        extract_result.definition.name,
+                        extract_result.definition.version,
+                        extract_result.definition.archive,
+                        status
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("Error: {}", e);
+                }
+            }
+        }
+
+        println!("\nSummary: {} succeeded, {} failed", success, failed);
+        if failed > 0 {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if let Some(name) = package_name {
+        match manager.extract(&name, force) {
+            Ok(result) => {
+                let status = if result.from_cache {
+                    "cached"
+                } else {
+                    "extracted"
+                };
+                println!(
+                    "{} {} {} [{}]",
+                    result.definition.name,
+                    result.definition.version,
+                    result.definition.archive,
+                    status
+                );
+                println!("Extracted to: {}", result.path.display());
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // No package specified and no --all/--list
+    eprintln!("Error: package name required (or use --all or --list)");
+    print_usage();
+    std::process::exit(1);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -445,7 +622,8 @@ fn main() {
                 print_usage();
                 std::process::exit(1);
             }
-            Ok(run_prerequisite_check())
+            run_prerequisite_check();
+            Ok(())
         }
         "config" => {
             if !subcommand_args.is_empty() {
@@ -453,16 +631,19 @@ fn main() {
                 print_usage();
                 std::process::exit(1);
             }
-            Ok(show_config(&config_path))
+            show_config(&config_path);
+            Ok(())
         }
         "fetch" => run_fetch(&config_path, &sources_path, &subcommand_args),
+        "extract" => run_extract(&config_path, &sources_path, &subcommand_args),
         "help" => {
             if !subcommand_args.is_empty() {
                 eprintln!("Error: help command does not accept arguments");
                 print_usage();
                 std::process::exit(1);
             }
-            Ok(print_usage())
+            print_usage();
+            Ok(())
         }
         _ => {
             eprintln!("Unknown command: {}", command);

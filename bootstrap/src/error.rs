@@ -1,7 +1,6 @@
 use std::io;
 use thiserror::Error;
 
-/// Errors that can occur during bootstrap operations.
 #[derive(Debug, Error)]
 pub enum BootstrapError {
     #[error("Configuration error: {0}")]
@@ -10,11 +9,13 @@ pub enum BootstrapError {
     #[error("Source error: {0}")]
     Source(#[from] SourceError),
 
+    #[error("Extraction error: {0}")]
+    Extract(#[from] ExtractError),
+
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 }
 
-/// Errors specific to source management.
 #[derive(Debug, Error)]
 pub enum SourceError {
     #[error("Invalid source definition: {0}")]
@@ -67,4 +68,66 @@ impl From<hex::FromHexError> for SourceError {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum ExtractError {
+    #[error("Invalid archive format: {0}")]
+    #[expect(dead_code)]
+    InvalidFormat(String),
+
+    #[error("Archive contains absolute path: {0}")]
+    AbsolutePath(String),
+
+    #[error("Archive contains path traversal: {0}")]
+    PathTraversal(String),
+
+    #[error("Archive contains unsafe symbolic link: {0}")]
+    UnsafeSymlink(String),
+
+    #[error("Archive contains unsafe hard link: {0}")]
+    UnsafeHardlink(String),
+
+    #[error("Archive contains unsupported special file: {0}")]
+    UnsupportedSpecialFile(String),
+
+    #[error("Extraction destination already exists: {0}")]
+    DestinationExists(String),
+
+    #[error("Extraction failed: {0}")]
+    ExtractionFailed(String),
+
+    #[error("Staging directory cleanup failed: {0}")]
+    #[expect(dead_code)]
+    StagingCleanupFailed(String),
+
+    #[error("Source archive not found: {0}")]
+    SourceNotFound(String),
+
+    #[error("Archive type not supported: {0}")]
+    UnsupportedArchiveType(String),
+
+    #[error("Archive is malformed or truncated: {0}")]
+    MalformedArchive(String),
+
+    #[error("Symlink target escaped staging directory: {0}")]
+    SymlinkEscape(String),
+
+    #[error("Cache marker missing or invalid: {0}")]
+    #[expect(dead_code)]
+    InvalidCacheMarker(String),
+
+    #[error("Cache marker checksum mismatch: expected {expected}, got {actual}")]
+    #[expect(dead_code)]
+    CacheChecksumMismatch { expected: String, actual: String },
+
+    #[error("Failed to create unique staging directory after {attempts} attempts")]
+    StagingCreationFailed { attempts: u32 },
+}
+
+impl From<std::io::Error> for ExtractError {
+    fn from(err: std::io::Error) -> Self {
+        ExtractError::ExtractionFailed(err.to_string())
+    }
+}
+
 pub type SourceResult<T> = std::result::Result<T, SourceError>;
+pub type ExtractResult<T> = std::result::Result<T, ExtractError>;
