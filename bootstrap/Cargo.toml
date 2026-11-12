@@ -17,7 +17,6 @@ flate2 = "1.0"
 xz2 = "0.1"
 zstd = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
-rand = "0.8"
 libc = "0.2"
 
 [dev-dependencies]
