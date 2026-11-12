@@ -515,24 +515,103 @@ impl ExtractManager {
         let format = self.detect_format(def)?;
         let file = fs::File::open(&archive_path)?;
 
-        match format {
+        // Create a temporary extraction directory inside staging
+        let tmp_dir = staging_path.join("tmp");
+        fs::create_dir_all(&tmp_dir).map_err(|e| {
+            ExtractError::ExtractionFailed(format!("failed to create tmp directory: {}", e))
+        })?;
+
+        // Extract to temporary directory
+        let extract_result = match format {
             ArchiveFormat::Gz => {
                 let decoder = GzDecoder::new(file);
                 let mut archive = Archive::new(decoder);
-                self.extract_tar(&mut archive, staging_path)?;
+                self.extract_tar(&mut archive, &tmp_dir)
             }
             ArchiveFormat::Xz => {
                 let decoder = XzDecoder::new(file);
                 let mut archive = Archive::new(decoder);
-                self.extract_tar(&mut archive, staging_path)?;
+                self.extract_tar(&mut archive, &tmp_dir)
             }
             ArchiveFormat::Zst => {
                 let decoder = ZstdDecoder::new(file)?;
                 let mut archive = Archive::new(decoder);
-                self.extract_tar(&mut archive, staging_path)?;
+                self.extract_tar(&mut archive, &tmp_dir)
+            }
+        };
+
+        // Clean up tmp_dir on extraction failure
+        if let Err(e) = extract_result {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+
+        // Post-process: strip common top-level directory if present
+        self.strip_top_level_directory(&tmp_dir, staging_path)?;
+
+        // Clean up temporary directory
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        Ok(())
+    }
+
+    /// Strips a common top-level directory from extracted contents.
+    /// Many source tarballs contain a single top-level directory (e.g., "zlib-1.4/")
+    /// which would cause double-nesting when extracted to a directory named after the package.
+    /// This function detects and removes that extra level.
+    fn strip_top_level_directory(&self, tmp_dir: &Path, staging_path: &Path) -> ExtractResult<()> {
+        let entries: Vec<_> = fs::read_dir(tmp_dir)
+            .map_err(|e| {
+                ExtractError::ExtractionFailed(format!("failed to read tmp directory: {}", e))
+            })?
+            .filter_map(|e| e.ok())
+            .collect();
+
+        // If there's exactly one entry and it's a directory, move its contents up
+        if entries.len() == 1 {
+            let entry = &entries[0];
+            let file_type = entry.file_type().map_err(|e| {
+                ExtractError::ExtractionFailed(format!("failed to get file type: {}", e))
+            })?;
+
+            if file_type.is_dir() {
+                let top_level = entry.path();
+                // Move all contents from top_level to staging_path
+                for entry in fs::read_dir(&top_level).map_err(|e| {
+                    ExtractError::ExtractionFailed(format!("failed to read top-level directory: {}", e))
+                })? {
+                    let entry = entry.map_err(|e| {
+                        ExtractError::ExtractionFailed(format!("failed to read directory entry: {}", e))
+                    })?;
+                    let dest = staging_path.join(entry.file_name());
+                    fs::rename(entry.path(), &dest).map_err(|e| {
+                        ExtractError::ExtractionFailed(format!(
+                            "failed to move extracted file '{}': {}",
+                            entry.file_name().display(),
+                            e
+                        ))
+                    })?;
+                }
+                return Ok(());
             }
         }
 
+        // Otherwise, move all contents from tmp_dir to staging_path
+        for entry in fs::read_dir(tmp_dir).map_err(|e| {
+            ExtractError::ExtractionFailed(format!("failed to read tmp directory: {}", e))
+        })? {
+            let entry = entry.map_err(|e| {
+                ExtractError::ExtractionFailed(format!("failed to read directory entry: {}", e))
+            })?;
+            let dest = staging_path.join(entry.file_name());
+            fs::rename(entry.path(), &dest).map_err(|e| {
+                ExtractError::ExtractionFailed(format!(
+                    "failed to move extracted file '{}': {}",
+                    entry.file_name().display(),
+                    e
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -2156,5 +2235,170 @@ openssl = { name = "openssl", version = "3.0.0", url = "https://example.com/open
         // The error should be about missing file, not about checksum validation
         let err = result.unwrap_err().to_string();
         assert!(!err.contains("SHA-256 must be 64 hex characters"));
+    }
+
+    #[test]
+    fn test_extract_strips_top_level_directory() {
+        // Test that archives with a single top-level directory (like zlib-1.4/)
+        // have that directory stripped during extraction to avoid double-nesting.
+        let config = create_test_config();
+        let mut manager = ExtractManager::new(config.clone());
+
+        let def = SourceDefinition {
+            name: "test-pkg".to_string(),
+            version: "1.0".to_string(),
+            url: "https://example.com/test.tar.gz".to_string(),
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            archive: "test.tar.gz".to_string(),
+        };
+
+        manager.sources.insert("test-pkg".to_string(), def.clone());
+
+        // Create archive with a top-level directory "test-pkg-1.0/" containing files
+        // This simulates typical source tarballs like zlib-1.4.tar.gz
+        let mut compressed = Vec::new();
+        {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            use tar::Builder;
+
+            let mut gz = GzEncoder::new(&mut compressed, Compression::default());
+            let mut tar = Builder::new(&mut gz);
+
+            // Add top-level directory entry
+            let mut header_dir = tar::Header::new_gnu();
+            header_dir.set_path("test-pkg-1.0/").unwrap();
+            header_dir.set_size(0);
+            header_dir.set_mode(0o755);
+            header_dir.set_entry_type(tar::EntryType::Directory);
+            header_dir.set_cksum();
+            tar.append(&header_dir, &[][..]).unwrap();
+
+            // Add file inside top-level directory
+            let mut header_file = tar::Header::new_gnu();
+            header_file.set_path("test-pkg-1.0/configure").unwrap();
+            header_file.set_size(10);
+            header_file.set_mode(0o755);
+            header_file.set_cksum();
+            tar.append(&header_file, &b"configure"[..]).unwrap();
+
+            // Add another file inside top-level directory
+            let mut header_file2 = tar::Header::new_gnu();
+            header_file2.set_path("test-pkg-1.0/Makefile.in").unwrap();
+            header_file2.set_size(10);
+            header_file2.set_mode(0o644);
+            header_file2.set_cksum();
+            tar.append(&header_file2, &b"Makefile.in"[..]).unwrap();
+
+            drop(tar);
+            gz.finish().unwrap();
+        }
+        setup_source_archive(&config, &def, &compressed);
+
+        let result = manager.extract("test-pkg", false).unwrap();
+
+        // Files should be directly in the extraction directory, not nested
+        assert!(result.path.join("configure").exists(), "configure should be at root of extraction dir");
+        assert!(result.path.join("Makefile.in").exists(), "Makefile.in should be at root of extraction dir");
+        // The top-level directory should NOT exist
+        assert!(!result.path.join("test-pkg-1.0").exists(), "top-level directory should be stripped");
+    }
+
+    #[test]
+    fn test_extract_no_top_level_directory() {
+        // Test that archives WITHOUT a single top-level directory work normally
+        let config = create_test_config();
+        let mut manager = ExtractManager::new(config.clone());
+
+        let def = SourceDefinition {
+            name: "test-pkg".to_string(),
+            version: "1.0".to_string(),
+            url: "https://example.com/test.tar.gz".to_string(),
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            archive: "test.tar.gz".to_string(),
+        };
+
+        manager.sources.insert("test-pkg".to_string(), def.clone());
+
+        // Create archive with multiple top-level entries (no single common directory)
+        let mut compressed = Vec::new();
+        {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            use tar::Builder;
+
+            let mut gz = GzEncoder::new(&mut compressed, Compression::default());
+            let mut tar = Builder::new(&mut gz);
+
+            // Add file at root
+            let mut header1 = tar::Header::new_gnu();
+            header1.set_path("file1.txt").unwrap();
+            header1.set_size(10);
+            header1.set_mode(0o644);
+            header1.set_cksum();
+            tar.append(&header1, &b"file1"[..]).unwrap();
+
+            // Add another file at root
+            let mut header2 = tar::Header::new_gnu();
+            header2.set_path("file2.txt").unwrap();
+            header2.set_size(10);
+            header2.set_mode(0o644);
+            header2.set_cksum();
+            tar.append(&header2, &b"file2"[..]).unwrap();
+
+            drop(tar);
+            gz.finish().unwrap();
+        }
+        setup_source_archive(&config, &def, &compressed);
+
+        let result = manager.extract("test-pkg", false).unwrap();
+
+        // Files should be at root of extraction directory
+        assert!(result.path.join("file1.txt").exists());
+        assert!(result.path.join("file2.txt").exists());
+    }
+
+    #[test]
+    fn test_extract_single_file_at_root() {
+        // Test that a single file at archive root (not in a directory) works
+        let config = create_test_config();
+        let mut manager = ExtractManager::new(config.clone());
+
+        let def = SourceDefinition {
+            name: "test-pkg".to_string(),
+            version: "1.0".to_string(),
+            url: "https://example.com/test.tar.gz".to_string(),
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            archive: "test.tar.gz".to_string(),
+        };
+
+        manager.sources.insert("test-pkg".to_string(), def.clone());
+
+        // Create archive with a single file at root (no directory)
+        let mut compressed = Vec::new();
+        {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            use tar::Builder;
+
+            let mut gz = GzEncoder::new(&mut compressed, Compression::default());
+            let mut tar = Builder::new(&mut gz);
+
+            let mut header = tar::Header::new_gnu();
+            header.set_path("single.txt").unwrap();
+            header.set_size(6);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append(&header, &b"single"[..]).unwrap();
+
+            drop(tar);
+            gz.finish().unwrap();
+        }
+        setup_source_archive(&config, &def, &compressed);
+
+        let result = manager.extract("test-pkg", false).unwrap();
+
+        assert!(result.path.join("single.txt").exists());
+        assert_eq!(fs::read(result.path.join("single.txt")).unwrap(), b"single");
     }
 }
