@@ -583,11 +583,29 @@ impl ExtractManager {
                     let entry = entry.map_err(|e| {
                         ExtractError::ExtractionFailed(format!("failed to read directory entry: {}", e))
                     })?;
-                    let dest = staging_path.join(entry.file_name());
+                    let file_name = entry.file_name();
+                    // Validate filename to prevent path traversal (defense in depth)
+                    let file_name_str = file_name.to_string_lossy();
+                    if file_name_str == "." || file_name_str == ".." || file_name_str.contains('/') || file_name_str.contains('\\') {
+                        return Err(ExtractError::ExtractionFailed(format!(
+                            "invalid filename in archive: {}",
+                            file_name_str
+                        )));
+                    }
+                    let dest = staging_path.join(&file_name);
+                    // Additional safety: verify dest is within staging_path after canonicalization
+                    let dest_canon = fs::canonicalize(&dest).unwrap_or(dest.clone());
+                    let staging_canon = fs::canonicalize(staging_path).unwrap_or(staging_path.to_path_buf());
+                    if !dest_canon.starts_with(&staging_canon) {
+                        return Err(ExtractError::ExtractionFailed(format!(
+                            "path traversal attempt: {}",
+                            file_name_str
+                        )));
+                    }
                     fs::rename(entry.path(), &dest).map_err(|e| {
                         ExtractError::ExtractionFailed(format!(
                             "failed to move extracted file '{}': {}",
-                            entry.file_name().display(),
+                            file_name_str,
                             e
                         ))
                     })?;
@@ -603,11 +621,29 @@ impl ExtractManager {
             let entry = entry.map_err(|e| {
                 ExtractError::ExtractionFailed(format!("failed to read directory entry: {}", e))
             })?;
-            let dest = staging_path.join(entry.file_name());
+            let file_name = entry.file_name();
+            // Validate filename to prevent path traversal (defense in depth)
+            let file_name_str = file_name.to_string_lossy();
+            if file_name_str == "." || file_name_str == ".." || file_name_str.contains('/') || file_name_str.contains('\\') {
+                return Err(ExtractError::ExtractionFailed(format!(
+                    "invalid filename in archive: {}",
+                    file_name_str
+                )));
+            }
+            let dest = staging_path.join(&file_name);
+            // Additional safety: verify dest is within staging_path after canonicalization
+            let dest_canon = fs::canonicalize(&dest).unwrap_or(dest.clone());
+            let staging_canon = fs::canonicalize(staging_path).unwrap_or(staging_path.to_path_buf());
+            if !dest_canon.starts_with(&staging_canon) {
+                return Err(ExtractError::ExtractionFailed(format!(
+                    "path traversal attempt: {}",
+                    file_name_str
+                )));
+            }
             fs::rename(entry.path(), &dest).map_err(|e| {
                 ExtractError::ExtractionFailed(format!(
                     "failed to move extracted file '{}': {}",
-                    entry.file_name().display(),
+                    file_name_str,
                     e
                 ))
             })?;
