@@ -1116,27 +1116,64 @@ impl BuildManager {
         Ok(())
     }
 
-    /// Atomically publishes staging directory contents to sysroot.
-    /// Uses rename for same-filesystem moves, falls back to copy+remove for cross-device.
+    /// Publishes staging directory contents to sysroot.
+    ///
+    /// Publication is atomic PER ENTRY (each file/directory rename is atomic on
+    /// same filesystem), NOT transactional across the entire package. If a cross-device
+    /// error occurs mid-way, already-moved entries remain in sysroot and remaining
+    /// entries are copied. There is no rollback of previously published entries.
+    ///
+    /// Existing files in sysroot are overwritten (standard Unix rename/copy behavior).
     fn atomic_publish_to_sysroot(&self, staging_dir: &Path) -> BuildResult<()> {
         let sysroot = self.sysroot_dir();
 
-        // Try atomic rename first (same filesystem)
-        match fs::rename(staging_dir, sysroot) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // If cross-device (EXDEV), fall back to copy+remove
-                if e.raw_os_error() == Some(libc::EXDEV)
-                    || e.kind() == std::io::ErrorKind::CrossesDevices
-                {
-                    self.copy_dir_all(staging_dir, sysroot)?;
-                    fs::remove_dir_all(staging_dir).map_err(BuildError::from)?;
-                    Ok(())
-                } else {
-                    Err(BuildError::from(e))
+        // Ensure sysroot exists
+        fs::create_dir_all(sysroot).map_err(BuildError::from)?;
+
+        // Collect all entries upfront so we can track which were moved
+        let entries: Vec<_> = fs::read_dir(staging_dir)
+            .map_err(BuildError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BuildError::from)?;
+
+        // Track which entries were successfully moved via rename
+        let mut moved_entries = Vec::new();
+
+        // Try atomic rename for each entry
+        for entry in &entries {
+            let src = entry.path();
+            let dst = sysroot.join(entry.file_name());
+
+            match fs::rename(&src, &dst) {
+                Ok(()) => {
+                    moved_entries.push(entry.file_name());
+                }
+                Err(e) => {
+                    // If cross-device, fall back to copy for REMAINING entries only
+                    if e.raw_os_error() == Some(libc::EXDEV)
+                        || e.kind() == std::io::ErrorKind::CrossesDevices
+                    {
+                        // Copy only entries that weren't already moved
+                        for remaining in entries.iter().skip(moved_entries.len()) {
+                            let src_remaining = remaining.path();
+                            let dst_remaining = sysroot.join(remaining.file_name());
+                            self.copy_dir_all(&src_remaining, &dst_remaining)?;
+                        }
+                        // Remove staging dir (now empty or contains only already-moved entries)
+                        fs::remove_dir_all(staging_dir).map_err(BuildError::from)?;
+                        return Ok(());
+                    }
+                    // Other errors: propagate without cleanup (caller handles staging cleanup)
+                    return Err(BuildError::from(e));
                 }
             }
         }
+
+        // All renames succeeded, staging_dir should now be empty
+        // Remove it (will fail if not empty, indicating a bug)
+        let _ = fs::remove_dir(staging_dir);
+
+        Ok(())
     }
 
     /// Cleans up the staging directory.
