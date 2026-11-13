@@ -1149,10 +1149,14 @@ impl BuildManager {
                     moved_entries.push(entry.file_name());
                 }
                 Err(e) => {
-                    // If cross-device, fall back to copy for REMAINING entries only
-                    if e.raw_os_error() == Some(libc::EXDEV)
-                        || e.kind() == std::io::ErrorKind::CrossesDevices
-                    {
+                    // If cross-device (EXDEV) or target directory non-empty (ENOTEMPTY),
+                    // fall back to copy for REMAINING entries only.
+                    // ENOTEMPTY occurs when renaming a directory into an existing
+                    // non-empty destination directory (common when merging into sysroot).
+                    let is_cross_device = e.raw_os_error() == Some(libc::EXDEV)
+                        || e.kind() == std::io::ErrorKind::CrossesDevices;
+                    let is_not_empty = e.raw_os_error() == Some(libc::ENOTEMPTY);
+                    if is_cross_device || is_not_empty {
                         // Copy only entries that weren't already moved
                         for remaining in entries.iter().skip(moved_entries.len()) {
                             let src_remaining = remaining.path();
@@ -4830,6 +4834,69 @@ install = [{ command = "echo", args = ["install"] }]
             let target = fs::read_link(dst.join("link.txt")).unwrap();
             assert_eq!(target, Path::new("file1.txt"));
         }
+    }
+
+    #[test]
+    fn test_publish_merges_into_existing_sysroot() {
+        // Regression test for ENOTEMPTY when publishing into sysroot
+        // that already contains non-empty directories.
+        let config = create_test_config();
+        let manager = BuildManager::new(config).unwrap();
+
+        let temp_dir = tempdir().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+        let sysroot = temp_dir.path().join("sysroot");
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::create_dir_all(&sysroot).unwrap();
+
+        // Pre-populate sysroot with existing package content (e.g., from previous package)
+        fs::create_dir_all(sysroot.join("usr/lib")).unwrap();
+        fs::write(sysroot.join("usr/lib/libexisting.so"), "existing").unwrap();
+        fs::create_dir_all(sysroot.join("usr/include")).unwrap();
+        fs::write(sysroot.join("usr/include/existing.h"), "existing header").unwrap();
+
+        // Create new package staging with overlapping directory structure
+        // This mimics zlib: staging/usr/{lib,include,share}
+        fs::create_dir_all(staging_dir.join("usr/lib")).unwrap();
+        fs::write(staging_dir.join("usr/lib/libz.so"), "zlib content").unwrap();
+        fs::create_dir_all(staging_dir.join("usr/include")).unwrap();
+        fs::write(staging_dir.join("usr/include/zlib.h"), "zlib header").unwrap();
+        fs::create_dir_all(staging_dir.join("usr/share/doc/zlib")).unwrap();
+        fs::write(staging_dir.join("usr/share/doc/zlib/README"), "docs").unwrap();
+
+        // Test the fallback path by using copy_dir_all directly
+        // (we can't easily trigger ENOTEMPTY in unit test without separate filesystems)
+        manager.copy_dir_all(&staging_dir, &sysroot).unwrap();
+
+        // Verify existing files are preserved
+        assert!(sysroot.join("usr/lib/libexisting.so").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/lib/libexisting.so")).unwrap(),
+            "existing"
+        );
+        assert!(sysroot.join("usr/include/existing.h").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/include/existing.h")).unwrap(),
+            "existing header"
+        );
+
+        // Verify new files are added
+        assert!(sysroot.join("usr/lib/libz.so").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/lib/libz.so")).unwrap(),
+            "zlib content"
+        );
+        assert!(sysroot.join("usr/include/zlib.h").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/include/zlib.h")).unwrap(),
+            "zlib header"
+        );
+        assert!(sysroot.join("usr/share/doc/zlib/README").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/share/doc/zlib/README")).unwrap(),
+            "docs"
+        );
     }
 
     #[test]
