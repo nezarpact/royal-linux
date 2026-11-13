@@ -77,8 +77,10 @@ impl ExtractManager {
 
     /// Computes the expected extraction path for a source definition.
     /// Uses package name and version for predictable naming.
+    /// Sources are extracted to the persistent source directory (not the ephemeral build directory)
+    /// so they survive build failures and can be reused across builds.
     pub fn extract_path(&self, def: &SourceDefinition) -> PathBuf {
-        self.build_dir()
+        self.source_dir()
             .join(format!("{}-{}", def.name, def.version))
     }
 
@@ -578,15 +580,25 @@ impl ExtractManager {
                 let top_level = entry.path();
                 // Move all contents from top_level to staging_path
                 for entry in fs::read_dir(&top_level).map_err(|e| {
-                    ExtractError::ExtractionFailed(format!("failed to read top-level directory: {}", e))
+                    ExtractError::ExtractionFailed(format!(
+                        "failed to read top-level directory: {}",
+                        e
+                    ))
                 })? {
                     let entry = entry.map_err(|e| {
-                        ExtractError::ExtractionFailed(format!("failed to read directory entry: {}", e))
+                        ExtractError::ExtractionFailed(format!(
+                            "failed to read directory entry: {}",
+                            e
+                        ))
                     })?;
                     let file_name = entry.file_name();
                     // Validate filename to prevent path traversal (defense in depth)
                     let file_name_str = file_name.to_string_lossy();
-                    if file_name_str == "." || file_name_str == ".." || file_name_str.contains('/') || file_name_str.contains('\\') {
+                    if file_name_str == "."
+                        || file_name_str == ".."
+                        || file_name_str.contains('/')
+                        || file_name_str.contains('\\')
+                    {
                         return Err(ExtractError::ExtractionFailed(format!(
                             "invalid filename in archive: {}",
                             file_name_str
@@ -595,7 +607,8 @@ impl ExtractManager {
                     let dest = staging_path.join(&file_name);
                     // Additional safety: verify dest is within staging_path after canonicalization
                     let dest_canon = fs::canonicalize(&dest).unwrap_or(dest.clone());
-                    let staging_canon = fs::canonicalize(staging_path).unwrap_or(staging_path.to_path_buf());
+                    let staging_canon =
+                        fs::canonicalize(staging_path).unwrap_or(staging_path.to_path_buf());
                     if !dest_canon.starts_with(&staging_canon) {
                         return Err(ExtractError::ExtractionFailed(format!(
                             "path traversal attempt: {}",
@@ -605,8 +618,7 @@ impl ExtractManager {
                     fs::rename(entry.path(), &dest).map_err(|e| {
                         ExtractError::ExtractionFailed(format!(
                             "failed to move extracted file '{}': {}",
-                            file_name_str,
-                            e
+                            file_name_str, e
                         ))
                     })?;
                 }
@@ -624,7 +636,11 @@ impl ExtractManager {
             let file_name = entry.file_name();
             // Validate filename to prevent path traversal (defense in depth)
             let file_name_str = file_name.to_string_lossy();
-            if file_name_str == "." || file_name_str == ".." || file_name_str.contains('/') || file_name_str.contains('\\') {
+            if file_name_str == "."
+                || file_name_str == ".."
+                || file_name_str.contains('/')
+                || file_name_str.contains('\\')
+            {
                 return Err(ExtractError::ExtractionFailed(format!(
                     "invalid filename in archive: {}",
                     file_name_str
@@ -633,7 +649,8 @@ impl ExtractManager {
             let dest = staging_path.join(&file_name);
             // Additional safety: verify dest is within staging_path after canonicalization
             let dest_canon = fs::canonicalize(&dest).unwrap_or(dest.clone());
-            let staging_canon = fs::canonicalize(staging_path).unwrap_or(staging_path.to_path_buf());
+            let staging_canon =
+                fs::canonicalize(staging_path).unwrap_or(staging_path.to_path_buf());
             if !dest_canon.starts_with(&staging_canon) {
                 return Err(ExtractError::ExtractionFailed(format!(
                     "path traversal attempt: {}",
@@ -643,8 +660,7 @@ impl ExtractManager {
             fs::rename(entry.path(), &dest).map_err(|e| {
                 ExtractError::ExtractionFailed(format!(
                     "failed to move extracted file '{}': {}",
-                    file_name_str,
-                    e
+                    file_name_str, e
                 ))
             })?;
         }
@@ -681,9 +697,9 @@ impl ExtractManager {
             effective_force = true;
         }
 
-        // Ensure build directory exists
-        fs::create_dir_all(self.build_dir()).map_err(|e| {
-            ExtractError::ExtractionFailed(format!("failed to create build directory: {}", e))
+        // Ensure source directory exists (where persistent extractions live)
+        fs::create_dir_all(self.source_dir()).map_err(|e| {
+            ExtractError::ExtractionFailed(format!("failed to create source directory: {}", e))
         })?;
 
         // Create unique staging directory
@@ -2334,10 +2350,19 @@ openssl = { name = "openssl", version = "3.0.0", url = "https://example.com/open
         let result = manager.extract("test-pkg", false).unwrap();
 
         // Files should be directly in the extraction directory, not nested
-        assert!(result.path.join("configure").exists(), "configure should be at root of extraction dir");
-        assert!(result.path.join("Makefile.in").exists(), "Makefile.in should be at root of extraction dir");
+        assert!(
+            result.path.join("configure").exists(),
+            "configure should be at root of extraction dir"
+        );
+        assert!(
+            result.path.join("Makefile.in").exists(),
+            "Makefile.in should be at root of extraction dir"
+        );
         // The top-level directory should NOT exist
-        assert!(!result.path.join("test-pkg-1.0").exists(), "top-level directory should be stripped");
+        assert!(
+            !result.path.join("test-pkg-1.0").exists(),
+            "top-level directory should be stripped"
+        );
     }
 
     #[test]
