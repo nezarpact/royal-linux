@@ -110,6 +110,19 @@ impl LogEntry {
     }
 }
 
+/// Build type determines how the package is built relative to its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildType {
+    /// In-tree build: source is copied to build_dir/src and built there.
+    /// This is the default for packages that don't support out-of-tree builds.
+    #[default]
+    InTree,
+    /// Out-of-tree build: source is copied to build_dir/src, build happens in build_dir/build.
+    /// The package's build system must support building from a separate directory.
+    OutOfTree,
+}
+
 /// Represents a build recipe for a package.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct BuildRecipe {
@@ -132,6 +145,9 @@ pub struct BuildRecipe {
     /// Working directory relative to the extracted source directory.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Build type: in_tree (default) or out_of_tree.
+    #[serde(default)]
+    pub build_type: BuildType,
 }
 
 /// A single build step (command to execute).
@@ -1078,11 +1094,17 @@ impl BuildManager {
     }
 
     /// Recursively copies a directory from src to dst, preserving symlinks.
+    /// Used for initial extraction and cross-device fallback where destination is guaranteed empty.
     fn copy_dir_all(&self, src: &Path, dst: &Path) -> BuildResult<()> {
         fs::create_dir_all(dst).map_err(BuildError::from)?;
 
-        for entry in fs::read_dir(src).map_err(BuildError::from)? {
-            let entry = entry.map_err(BuildError::from)?;
+        let mut entries: Vec<_> = fs::read_dir(src)
+            .map_err(BuildError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BuildError::from)?;
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
             let src_path = entry.path();
             let dst_path = dst.join(entry.file_name());
 
@@ -1116,66 +1138,307 @@ impl BuildManager {
         Ok(())
     }
 
+    /// Copies source directory to build directory.
+    /// This creates a working copy in the build directory so the persistent source remains clean.
+    /// Preserves symlinks, permissions, and directory structure.
+    fn copy_source_to_build_dir(
+        &self,
+        source_dir: &Path,
+        build_dir: &Path,
+    ) -> BuildResult<PathBuf> {
+        let target = build_dir.join("src");
+        if target.exists() {
+            fs::remove_dir_all(&target).map_err(BuildError::from)?;
+        }
+
+        // Use regular copy (not hardlinks) to ensure build isolation.
+        // Hardlinks would cause build artifacts to pollute the source directory
+        // if the source already contains files from a previous build.
+        Self::copy_dir_recursive(source_dir, &target)?;
+
+        Ok(target)
+    }
+
+    /// Recursively copies a directory using regular file copy.
+    /// Preserves symlinks, permissions, and directory structure.
+    fn copy_dir_recursive(src: &Path, dst: &Path) -> BuildResult<()> {
+        fs::create_dir_all(dst).map_err(BuildError::from)?;
+
+        let mut entries: Vec<_> = fs::read_dir(src)
+            .map_err(BuildError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BuildError::from)?;
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+
+            let file_type = entry.file_type().map_err(BuildError::from)?;
+
+            if file_type.is_dir() {
+                Self::copy_dir_recursive(&src_path, &dst_path)?;
+            } else if file_type.is_file() {
+                // Use regular copy to ensure isolation from source directory
+                fs::copy(&src_path, &dst_path).map_err(BuildError::from)?;
+            } else if file_type.is_symlink() {
+                let target = fs::read_link(&src_path).map_err(BuildError::from)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::symlink as unix_symlink;
+                    unix_symlink(&target, &dst_path).map_err(BuildError::from)?;
+                }
+                #[cfg(windows)]
+                {
+                    if fs::metadata(&src_path).map_err(BuildError::from)?.is_dir() {
+                        std::os::windows::fs::symlink_dir(&target, &dst_path)
+                            .map_err(BuildError::from)?;
+                    } else {
+                        std::os::windows::fs::symlink_file(&target, &dst_path)
+                            .map_err(BuildError::from)?;
+                    }
+                }
+            }
+            // Skip other file types (sockets, devices, etc.)
+        }
+
+        Ok(())
+    }
+
+    /// Atomically replaces a file at dst with src.
+    /// Writes to a temporary file in the same directory, then renames over destination.
+    fn atomic_replace_file(&self, src: &Path, dst: &Path) -> BuildResult<()> {
+        // Read source content
+        let content = fs::read(src).map_err(BuildError::from)?;
+
+        // Get destination parent directory for temp file
+        let dst_parent = dst.parent().ok_or_else(|| {
+            BuildError::ExecutionFailed(format!(
+                "destination path '{}' has no parent directory",
+                dst.display()
+            ))
+        })?;
+
+        // Create temporary file in same directory (ensures same filesystem for atomic rename)
+        let temp_path = dst_parent.join(format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+
+        // Write to temp file
+        fs::write(&temp_path, &content).map_err(BuildError::from)?;
+
+        // Preserve source file permissions
+        if let Ok(metadata) = fs::metadata(src) {
+            let perms = metadata.permissions();
+            let _ = fs::set_permissions(&temp_path, perms);
+        }
+
+        // Atomic rename over destination
+        fs::rename(&temp_path, dst).map_err(BuildError::from)?;
+
+        Ok(())
+    }
+
+    /// Atomically replaces a symlink at dst with src.
+    /// Creates a temporary symlink in the same directory, then renames over destination.
+    fn atomic_replace_symlink(&self, src: &Path, dst: &Path) -> BuildResult<()> {
+        // Read target of source symlink (don't follow)
+        let target = fs::read_link(src).map_err(BuildError::from)?;
+
+        // Get destination parent directory for temp symlink
+        let dst_parent = dst.parent().ok_or_else(|| {
+            BuildError::ExecutionFailed(format!(
+                "destination path '{}' has no parent directory",
+                dst.display()
+            ))
+        })?;
+
+        // Create temporary symlink in same directory
+        let temp_path = dst_parent.join(format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink as unix_symlink;
+            unix_symlink(&target, &temp_path).map_err(BuildError::from)?;
+        }
+        #[cfg(windows)]
+        {
+            // On Windows, we need to know if it's a file or dir symlink
+            // Use the source metadata to determine
+            let metadata = fs::metadata(src).map_err(BuildError::from)?;
+            if metadata.is_dir() {
+                std::os::windows::fs::symlink_dir(&target, &temp_path).map_err(BuildError::from)?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, &temp_path)
+                    .map_err(BuildError::from)?;
+            }
+        }
+
+        // Atomic rename over destination
+        fs::rename(&temp_path, dst).map_err(BuildError::from)?;
+
+        Ok(())
+    }
+
+    /// Returns a human-readable description of a file type for error messages.
+    fn describe_file_type(file_type: &std::fs::FileType) -> &'static str {
+        if file_type.is_dir() {
+            "directory"
+        } else if file_type.is_file() {
+            "file"
+        } else if file_type.is_symlink() {
+            "symlink"
+        } else {
+            "special file"
+        }
+    }
+
+    /// Merges a single entry (file, directory, or symlink) from src to dst.
+    /// Handles conflicts and uses atomic operations where possible.
+    /// - If destination doesn't exist: copies entry
+    /// - If both are directories: recursively merges
+    /// - If both are files: atomically replaces destination
+    /// - If both are symlinks: atomically replaces destination
+    /// - If types conflict: returns error
+    /// - Never follows symlinks during traversal.
+    fn merge_entry(&self, src: &Path, dst: &Path, src_type: &std::fs::FileType) -> BuildResult<()> {
+        let dst_exists = dst.symlink_metadata().is_ok();
+
+        if !dst_exists {
+            // Destination doesn't exist - copy entry
+            self.copy_entry(src, dst, src_type)?;
+        } else {
+            // Destination exists - check types
+            let dst_metadata = fs::symlink_metadata(dst).map_err(BuildError::from)?;
+            let dst_type = dst_metadata.file_type();
+
+            // Both directories: recurse
+            if src_type.is_dir() && dst_type.is_dir() {
+                self.merge_dir_all(src, dst)?;
+            }
+            // Both regular files: atomic replace
+            else if src_type.is_file() && dst_type.is_file() {
+                self.atomic_replace_file(src, dst)?;
+            }
+            // Both symlinks: atomic replace
+            else if src_type.is_symlink() && dst_type.is_symlink() {
+                self.atomic_replace_symlink(src, dst)?;
+            }
+            // Incompatible types: error
+            else {
+                return Err(BuildError::ExecutionFailed(format!(
+                    "incompatible file types at '{}': source is {} but destination is {}",
+                    dst.display(),
+                    Self::describe_file_type(src_type),
+                    Self::describe_file_type(&dst_type)
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recursively merges src directory into dst directory, handling conflicts properly.
+    /// - If destination doesn't exist: creates it and copies all entries
+    /// - If both are directories: recursively merges each entry
+    /// - If types conflict at any level: returns error
+    /// - Never follows symlinks during traversal.
+    /// - Preserves source staging data on failure.
+    fn merge_dir_all(&self, src: &Path, dst: &Path) -> BuildResult<()> {
+        // Ensure destination directory exists
+        fs::create_dir_all(dst).map_err(BuildError::from)?;
+
+        let mut entries: Vec<_> = fs::read_dir(src)
+            .map_err(BuildError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BuildError::from)?;
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+
+            // Use symlink_metadata to detect dangling symlinks without following them
+            let src_type = entry.file_type().map_err(BuildError::from)?;
+
+            // Use merge_entry to handle each entry
+            self.merge_entry(&src_path, &dst_path, &src_type)?;
+        }
+
+        Ok(())
+    }
+
+    /// Copies a single entry (file, directory, or symlink) from src to dst.
+    /// Used when destination doesn't exist.
+    fn copy_entry(&self, src: &Path, dst: &Path, src_type: &std::fs::FileType) -> BuildResult<()> {
+        if src_type.is_dir() {
+            self.copy_dir_all(src, dst)?;
+        } else if src_type.is_file() {
+            fs::copy(src, dst).map_err(BuildError::from)?;
+        } else if src_type.is_symlink() {
+            let target = fs::read_link(src).map_err(BuildError::from)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink as unix_symlink;
+                unix_symlink(&target, dst).map_err(BuildError::from)?;
+            }
+            #[cfg(windows)]
+            {
+                if fs::metadata(src).map_err(BuildError::from)?.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, dst).map_err(BuildError::from)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, dst).map_err(BuildError::from)?;
+                }
+            }
+        }
+        // Skip other file types (sockets, devices, etc.)
+        Ok(())
+    }
+
     /// Publishes staging directory contents to sysroot.
     ///
-    /// Publication is atomic PER ENTRY (each file/directory rename is atomic on
+    /// Publication is atomic PER ENTRY (each file/symlink rename is atomic on
     /// same filesystem), NOT transactional across the entire package. If a cross-device
     /// error occurs mid-way, already-moved entries remain in sysroot and remaining
-    /// entries are copied. There is no rollback of previously published entries.
+    /// entries are merged. There is no rollback of previously published entries.
     ///
-    /// Existing files in sysroot are overwritten (standard Unix rename/copy behavior).
+    /// Existing files/symlinks in sysroot are replaced atomically.
+    /// Existing directories are merged recursively.
+    /// Incompatible type conflicts (file vs dir, file vs symlink, etc.) return an error.
     fn atomic_publish_to_sysroot(&self, staging_dir: &Path) -> BuildResult<()> {
         let sysroot = self.sysroot_dir();
 
         // Ensure sysroot exists
         fs::create_dir_all(sysroot).map_err(BuildError::from)?;
 
-        // Collect all entries upfront so we can track which were moved
-        let entries: Vec<_> = fs::read_dir(staging_dir)
+        // Collect all entries upfront
+        let mut entries: Vec<_> = fs::read_dir(staging_dir)
             .map_err(BuildError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(BuildError::from)?;
 
-        // Track which entries were successfully moved via rename
-        let mut moved_entries = Vec::new();
+        // Sort entries by filename for deterministic order
+        entries.sort_by_key(|e| e.file_name());
 
-        // Try atomic rename for each entry
+        // Use merge_entry for all entries - this copies from staging to sysroot
+        // using atomic operations in sysroot (temp file + rename), preserving staging.
+        // On success, we remove staging. On failure, staging is untouched.
         for entry in &entries {
             let src = entry.path();
             let dst = sysroot.join(entry.file_name());
+            let src_type = entry.file_type().map_err(BuildError::from)?;
 
-            match fs::rename(&src, &dst) {
-                Ok(()) => {
-                    moved_entries.push(entry.file_name());
-                }
-                Err(e) => {
-                    // If cross-device (EXDEV) or target directory non-empty (ENOTEMPTY),
-                    // fall back to copy for REMAINING entries only.
-                    // ENOTEMPTY occurs when renaming a directory into an existing
-                    // non-empty destination directory (common when merging into sysroot).
-                    let is_cross_device = e.raw_os_error() == Some(libc::EXDEV)
-                        || e.kind() == std::io::ErrorKind::CrossesDevices;
-                    let is_not_empty = e.raw_os_error() == Some(libc::ENOTEMPTY);
-                    if is_cross_device || is_not_empty {
-                        // Copy only entries that weren't already moved
-                        for remaining in entries.iter().skip(moved_entries.len()) {
-                            let src_remaining = remaining.path();
-                            let dst_remaining = sysroot.join(remaining.file_name());
-                            self.copy_dir_all(&src_remaining, &dst_remaining)?;
-                        }
-                        // Remove staging dir (now empty or contains only already-moved entries)
-                        fs::remove_dir_all(staging_dir).map_err(BuildError::from)?;
-                        return Ok(());
-                    }
-                    // Other errors: propagate without cleanup (caller handles staging cleanup)
-                    return Err(BuildError::from(e));
-                }
-            }
+            self.merge_entry(&src, &dst, &src_type)?;
         }
 
-        // All renames succeeded, staging_dir should now be empty
-        // Remove it (will fail if not empty, indicating a bug)
-        let _ = fs::remove_dir(staging_dir);
+        // All entries merged successfully - remove staging directory
+        fs::remove_dir_all(staging_dir).map_err(BuildError::from)?;
 
         Ok(())
     }
@@ -1253,10 +1516,29 @@ impl BuildManager {
             }
         };
 
-        let workdir = self.recipe_workdir(&recipe, &source_dir);
+        // Prepare build directory: copy source to build_dir/src
+        // This keeps the persistent source directory clean
+        let effective_source_dir = self.copy_source_to_build_dir(&source_dir, &build_dir)?;
 
-        // Validate that the recipe workdir is within the source directory
-        Self::validate_path_within_base(&source_dir, &workdir)?;
+        // Determine base workdir based on build type
+        let (base_workdir, _build_subdir) = match recipe.build_type {
+            BuildType::InTree => {
+                // In-tree build: work in the source copy directly
+                (effective_source_dir.clone(), None)
+            }
+            BuildType::OutOfTree => {
+                // Out-of-tree build: create build subdirectory, work there
+                let build_subdir = build_dir.join("build");
+                fs::create_dir_all(&build_subdir).map_err(BuildError::from)?;
+                (build_dir.clone(), Some(build_subdir))
+            }
+        };
+
+        // Compute recipe workdir relative to effective source
+        let workdir = self.recipe_workdir(&recipe, &effective_source_dir);
+
+        // Validate that the recipe workdir is within the effective source directory
+        Self::validate_path_within_base(&effective_source_dir, &workdir)?;
 
         // Log build phase
         let phase_entry =
@@ -1268,11 +1550,19 @@ impl BuildManager {
         }
 
         // Execute build steps - DESTDIR points to staging directory
+        // Use base_workdir (effective source for InTree, build_dir for OutOfTree)
         for step in &recipe.build {
+            let step_workdir = if let Some(ref wd) = step.workdir {
+                base_workdir.join(wd)
+            } else {
+                workdir.clone()
+            };
+            // Validate step workdir is within base_workdir
+            Self::validate_path_within_base(&base_workdir, &step_workdir)?;
             let result = self.execute_step(
                 &recipe,
                 step,
-                &workdir,
+                &base_workdir,
                 &build_dir,
                 &mut log_file,
                 Some(&staging_dir),
@@ -1305,10 +1595,17 @@ impl BuildManager {
 
         // Execute install steps - DESTDIR points to staging directory
         for step in &recipe.install {
+            let step_workdir = if let Some(ref wd) = step.workdir {
+                base_workdir.join(wd)
+            } else {
+                workdir.clone()
+            };
+            // Validate step workdir is within base_workdir
+            Self::validate_path_within_base(&base_workdir, &step_workdir)?;
             let result = self.execute_step(
                 &recipe,
                 step,
-                &workdir,
+                &base_workdir,
                 &build_dir,
                 &mut log_file,
                 Some(&staging_dir),
@@ -1625,6 +1922,7 @@ staging = "workspace/staging"
             }],
             env: HashMap::new(),
             workdir: None,
+            build_type: BuildType::InTree,
         }
     }
 
@@ -1739,6 +2037,7 @@ staging = "workspace/staging"
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -1759,6 +2058,7 @@ staging = "workspace/staging"
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
         ]);
@@ -1793,6 +2093,7 @@ staging = "workspace/staging"
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -1813,6 +2114,7 @@ staging = "workspace/staging"
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
         ]);
@@ -3246,6 +3548,7 @@ install = [{ command = "echo", args = ["install b"] }]
     #[test]
     fn test_build_with_out_of_tree_build() {
         // Test build with separate build directory (out-of-tree)
+        // In the new system: source is copied to build_dir/src, build happens in build_dir/build
         let config = create_test_config();
         let mut manager = BuildManager::new(config.clone()).unwrap();
 
@@ -3253,14 +3556,16 @@ install = [{ command = "echo", args = ["install b"] }]
         recipe.name = "out-of-tree-test".to_string();
         recipe.version = "1.0".to_string();
         recipe.source = "test-source".to_string();
+        recipe.build_type = BuildType::OutOfTree;
         recipe.workdir = Some("src".to_string());
         recipe.build = vec![BuildStep {
             command: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
+                // In new system: from build_dir/build, source is at ../src
                 "mkdir -p ../build && echo 'built' > ../build/output.txt".to_string(),
             ],
-            workdir: Some("src".to_string()),
+            workdir: Some("build".to_string()),
             env: HashMap::new(),
             description: Some("Build in separate directory".to_string()),
             continue_on_failure: false,
@@ -3277,13 +3582,20 @@ install = [{ command = "echo", args = ["install b"] }]
         fs::create_dir_all(&build_dir).unwrap();
         fs::create_dir_all(&staging_dir).unwrap();
 
+        // Simulate the build() function's setup for out-of-tree:
+        // 1. Copy source to build_dir/src
+        BuildManager::copy_dir_recursive(&source_dir, &build_dir.join("src")).unwrap();
+        // 2. Create build_dir/build
+        fs::create_dir_all(build_dir.join("build")).unwrap();
+
         let mut log_file = tempfile::NamedTempFile::new().unwrap();
 
         let step = recipe.build[0].clone();
+        // In new system, base_workdir = build_dir for out-of-tree
         let result = manager.execute_step(
             &recipe,
             &step,
-            &source_dir,
+            &build_dir, // base_workdir = build_dir for out-of-tree
             &build_dir,
             log_file.as_file_mut(),
             Some(&staging_dir),
@@ -3294,8 +3606,8 @@ install = [{ command = "echo", args = ["install b"] }]
             result
         );
 
-        // Verify output in source_dir/build (since workdir is source_dir/src and command uses ../build)
-        assert!(source_dir.join("build/output.txt").exists());
+        // Verify output in build_dir/build (since base_workdir=build_dir, step workdir=build)
+        assert!(build_dir.join("build/output.txt").exists());
     }
 
     // =========================================================================
@@ -3535,6 +3847,7 @@ install = [{ command = "echo", args = ["install b"] }]
             install: vec![],
             env: HashMap::new(),
             workdir: None,
+            build_type: BuildType::InTree,
         };
         let recipe2 = BuildRecipe {
             name: "pkg-b".to_string(),
@@ -3545,6 +3858,7 @@ install = [{ command = "echo", args = ["install b"] }]
             install: vec![],
             env: HashMap::new(),
             workdir: None,
+            build_type: BuildType::InTree,
         };
 
         let staging1 = manager.package_staging_dir(&recipe1);
@@ -3674,6 +3988,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -3694,6 +4009,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -3714,6 +4030,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -3734,6 +4051,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
         ]);
@@ -3785,6 +4103,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -3805,6 +4124,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -3825,6 +4145,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
         ]);
@@ -3857,6 +4178,7 @@ install = [{ command = "echo", args = ["install b"] }]
                 install: vec![],
                 env: HashMap::new(),
                 workdir: None,
+                build_type: BuildType::InTree,
             },
         )]);
 
@@ -3891,6 +4213,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -3911,6 +4234,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -3931,6 +4255,7 @@ install = [{ command = "echo", args = ["install b"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
         ]);
@@ -4661,6 +4986,7 @@ install = [{ command = "echo", args = ["install"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -4681,6 +5007,7 @@ install = [{ command = "echo", args = ["install"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -4701,6 +5028,7 @@ install = [{ command = "echo", args = ["install"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
         ]);
@@ -4733,6 +5061,7 @@ install = [{ command = "echo", args = ["install"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -4753,6 +5082,7 @@ install = [{ command = "echo", args = ["install"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
             (
@@ -4773,6 +5103,7 @@ install = [{ command = "echo", args = ["install"] }]
                     install: vec![],
                     env: HashMap::new(),
                     workdir: None,
+                    build_type: BuildType::InTree,
                 },
             ),
         ]);
@@ -4900,6 +5231,416 @@ install = [{ command = "echo", args = ["install"] }]
     }
 
     #[test]
+    fn test_atomic_publish_merges_existing_nonempty_usr() {
+        // Test atomic_publish_to_sysroot with pre-existing non-empty usr directory
+        let config = create_test_config();
+        let manager = BuildManager::new(config).unwrap();
+
+        // Use the config's sysroot path for the test
+        let sysroot = manager.sysroot_dir().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::create_dir_all(&sysroot).unwrap();
+
+        // Pre-populate sysroot with existing package (e.g., from previous package install)
+        fs::create_dir_all(sysroot.join("usr/lib")).unwrap();
+        fs::write(sysroot.join("usr/lib/libexisting.so"), "existing lib").unwrap();
+        fs::create_dir_all(sysroot.join("usr/include")).unwrap();
+        fs::write(sysroot.join("usr/include/existing.h"), "existing header").unwrap();
+
+        // Create new package staging with overlapping directories (like zlib)
+        fs::create_dir_all(staging_dir.join("usr/lib")).unwrap();
+        fs::write(staging_dir.join("usr/lib/libz.so"), "zlib lib").unwrap();
+        fs::create_dir_all(staging_dir.join("usr/include")).unwrap();
+        fs::write(staging_dir.join("usr/include/zlib.h"), "zlib header").unwrap();
+        fs::create_dir_all(staging_dir.join("usr/share/doc/zlib")).unwrap();
+        fs::write(staging_dir.join("usr/share/doc/zlib/README"), "zlib docs").unwrap();
+
+        // Call atomic_publish_to_sysroot directly
+        manager.atomic_publish_to_sysroot(&staging_dir).unwrap();
+
+        // Verify existing files preserved
+        assert!(sysroot.join("usr/lib/libexisting.so").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/lib/libexisting.so")).unwrap(),
+            "existing lib"
+        );
+        assert!(sysroot.join("usr/include/existing.h").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/include/existing.h")).unwrap(),
+            "existing header"
+        );
+
+        // Verify new files added
+        assert!(sysroot.join("usr/lib/libz.so").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/lib/libz.so")).unwrap(),
+            "zlib lib"
+        );
+        assert!(sysroot.join("usr/include/zlib.h").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/include/zlib.h")).unwrap(),
+            "zlib header"
+        );
+        assert!(sysroot.join("usr/share/doc/zlib/README").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/share/doc/zlib/README")).unwrap(),
+            "zlib docs"
+        );
+    }
+
+    #[test]
+    fn test_atomic_publish_replaces_existing_file() {
+        // Test atomic replacement of existing file
+        let config = create_test_config();
+        let manager = BuildManager::new(config).unwrap();
+
+        let sysroot = manager.sysroot_dir().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::create_dir_all(&sysroot).unwrap();
+
+        // Pre-populate sysroot with a file
+        fs::write(sysroot.join("file.txt"), "old content").unwrap();
+
+        // Create staging with same file but different content
+        fs::write(staging_dir.join("file.txt"), "new content").unwrap();
+
+        // Publish - should replace the file atomically
+        manager.atomic_publish_to_sysroot(&staging_dir).unwrap();
+
+        // Verify file was replaced with new content
+        assert!(sysroot.join("file.txt").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("file.txt")).unwrap(),
+            "new content"
+        );
+    }
+
+    #[test]
+    fn test_atomic_publish_replaces_existing_symlink() {
+        // Test atomic replacement of existing symlink
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let config = create_test_config();
+            let manager = BuildManager::new(config).unwrap();
+
+            let sysroot = manager.sysroot_dir().to_path_buf();
+            let temp_dir = tempdir().unwrap();
+            let staging_dir = temp_dir.path().join("staging");
+
+            fs::create_dir_all(&staging_dir).unwrap();
+            fs::create_dir_all(&sysroot).unwrap();
+
+            // Pre-populate sysroot with a symlink
+            fs::write(sysroot.join("target_old.txt"), "old target").unwrap();
+            symlink("target_old.txt", sysroot.join("link.txt")).unwrap();
+
+            // Create staging with same symlink name but different target
+            fs::write(staging_dir.join("target_new.txt"), "new target").unwrap();
+            symlink("target_new.txt", staging_dir.join("link.txt")).unwrap();
+
+            // Publish - should replace the symlink atomically
+            manager.atomic_publish_to_sysroot(&staging_dir).unwrap();
+
+            // Verify symlink was replaced with new target
+            assert!(sysroot.join("link.txt").exists());
+            let target = fs::read_link(sysroot.join("link.txt")).unwrap();
+            assert_eq!(target, Path::new("target_new.txt"));
+            assert!(sysroot.join("target_new.txt").exists());
+            assert_eq!(
+                fs::read_to_string(sysroot.join("target_new.txt")).unwrap(),
+                "new target"
+            );
+            // Old target should still exist (not removed)
+            assert!(sysroot.join("target_old.txt").exists());
+        }
+    }
+
+    #[test]
+    fn test_atomic_publish_new_symlinks() {
+        // Test publishing new symlinks to empty sysroot
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let config = create_test_config();
+            let manager = BuildManager::new(config).unwrap();
+
+            let sysroot = manager.sysroot_dir().to_path_buf();
+            let temp_dir = tempdir().unwrap();
+            let staging_dir = temp_dir.path().join("staging");
+
+            fs::create_dir_all(&staging_dir).unwrap();
+            fs::create_dir_all(&sysroot).unwrap();
+
+            // Create staging with symlinks
+            fs::write(staging_dir.join("libfoo.so.1.0"), "lib content").unwrap();
+            symlink("libfoo.so.1.0", staging_dir.join("libfoo.so.1")).unwrap();
+            symlink("libfoo.so.1", staging_dir.join("libfoo.so")).unwrap();
+            fs::create_dir_all(staging_dir.join("bin")).unwrap();
+            fs::write(staging_dir.join("bin/foo"), "binary").unwrap();
+            fs::create_dir_all(staging_dir.join("usr/bin")).unwrap();
+            symlink("../../bin/foo", staging_dir.join("usr/bin/foo")).unwrap();
+
+            // Publish
+            manager.atomic_publish_to_sysroot(&staging_dir).unwrap();
+
+            // Verify all symlinks created correctly
+            assert!(sysroot.join("libfoo.so.1.0").exists());
+            assert_eq!(
+                fs::read_to_string(sysroot.join("libfoo.so.1.0")).unwrap(),
+                "lib content"
+            );
+            assert!(sysroot.join("libfoo.so.1").exists());
+            let target = fs::read_link(sysroot.join("libfoo.so.1")).unwrap();
+            assert_eq!(target, Path::new("libfoo.so.1.0"));
+            assert!(sysroot.join("libfoo.so").exists());
+            let target = fs::read_link(sysroot.join("libfoo.so")).unwrap();
+            assert_eq!(target, Path::new("libfoo.so.1"));
+            assert!(sysroot.join("usr/bin/foo").exists());
+            let target = fs::read_link(sysroot.join("usr/bin/foo")).unwrap();
+            assert_eq!(target, Path::new("../../bin/foo"));
+        }
+    }
+
+    #[test]
+    fn test_atomic_publish_incompatible_file_vs_dir() {
+        // Test error on incompatible types: file in sysroot, directory in staging
+        let config = create_test_config();
+        let manager = BuildManager::new(config).unwrap();
+
+        let sysroot = manager.sysroot_dir().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::create_dir_all(&sysroot).unwrap();
+
+        // Sysroot has a file
+        fs::write(sysroot.join("conflict"), "file content").unwrap();
+
+        // Staging has a directory with same name
+        fs::create_dir_all(staging_dir.join("conflict")).unwrap();
+        fs::write(staging_dir.join("conflict/inside.txt"), "inside").unwrap();
+
+        // Should fail with clear error
+        let result = manager.atomic_publish_to_sysroot(&staging_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("incompatible file types"));
+        assert!(err.contains("conflict"));
+        assert!(err.contains("source is directory"));
+        assert!(err.contains("destination is file"));
+
+        // Verify staging is preserved on failure
+        assert!(staging_dir.join("conflict").exists());
+        assert!(staging_dir.join("conflict/inside.txt").exists());
+    }
+
+    #[test]
+    fn test_atomic_publish_incompatible_dir_vs_file() {
+        // Test error on incompatible types: directory in sysroot, file in staging
+        let config = create_test_config();
+        let manager = BuildManager::new(config).unwrap();
+
+        let sysroot = manager.sysroot_dir().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::create_dir_all(&sysroot).unwrap();
+
+        // Sysroot has a directory
+        fs::create_dir_all(sysroot.join("conflict")).unwrap();
+        fs::write(sysroot.join("conflict/inside.txt"), "inside").unwrap();
+
+        // Staging has a file with same name
+        fs::write(staging_dir.join("conflict"), "file content").unwrap();
+
+        // Should fail with clear error
+        let result = manager.atomic_publish_to_sysroot(&staging_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("incompatible file types"));
+        assert!(err.contains("conflict"));
+        assert!(err.contains("source is file"));
+        assert!(err.contains("destination is directory"));
+
+        // Verify staging is preserved on failure
+        assert!(staging_dir.join("conflict").exists());
+    }
+
+    #[test]
+    fn test_atomic_publish_incompatible_symlink_vs_file() {
+        // Test error on incompatible types: symlink in sysroot, file in staging
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let config = create_test_config();
+            let manager = BuildManager::new(config).unwrap();
+
+            let sysroot = manager.sysroot_dir().to_path_buf();
+            let temp_dir = tempdir().unwrap();
+            let staging_dir = temp_dir.path().join("staging");
+
+            fs::create_dir_all(&staging_dir).unwrap();
+            fs::create_dir_all(&sysroot).unwrap();
+
+            // Sysroot has a symlink
+            fs::write(sysroot.join("target.txt"), "target").unwrap();
+            symlink("target.txt", sysroot.join("conflict")).unwrap();
+
+            // Staging has a file with same name
+            fs::write(staging_dir.join("conflict"), "file content").unwrap();
+
+            // Should fail with clear error
+            let result = manager.atomic_publish_to_sysroot(&staging_dir);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("incompatible file types"));
+            assert!(err.contains("conflict"));
+            assert!(err.contains("source is file"));
+            assert!(err.contains("destination is symlink"));
+        }
+    }
+
+    #[test]
+    fn test_atomic_publish_partial_failure_behavior() {
+        // Test that already-published entries remain in sysroot on partial failure
+        let config = create_test_config();
+        let manager = BuildManager::new(config).unwrap();
+
+        let sysroot = manager.sysroot_dir().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::create_dir_all(&sysroot).unwrap();
+
+        // Pre-populate sysroot with a file that will conflict with the LAST entry
+        fs::write(sysroot.join("99_conflict.txt"), "sysroot content").unwrap();
+
+        // Create staging with multiple files, last one will conflict (dir vs file)
+        // Use numeric prefixes to control sort order (processed in alphabetical order)
+        fs::write(staging_dir.join("01_file1.txt"), "content1").unwrap();
+        fs::write(staging_dir.join("02_file2.txt"), "content2").unwrap();
+        fs::create_dir_all(staging_dir.join("99_conflict.txt")).unwrap(); // This is a dir in staging
+        fs::write(staging_dir.join("99_conflict.txt/inside.txt"), "inside").unwrap();
+
+        // Publish - should fail on the last entry (99_conflict.txt)
+        let result = manager.atomic_publish_to_sysroot(&staging_dir);
+        assert!(result.is_err());
+
+        // Verify first two files were published successfully (partial publication)
+        assert!(sysroot.join("01_file1.txt").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("01_file1.txt")).unwrap(),
+            "content1"
+        );
+        assert!(sysroot.join("02_file2.txt").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("02_file2.txt")).unwrap(),
+            "content2"
+        );
+
+        // Verify 99_conflict.txt in sysroot is unchanged (still a file)
+        assert!(sysroot.join("99_conflict.txt").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("99_conflict.txt")).unwrap(),
+            "sysroot content"
+        );
+
+        // Verify staging is preserved on failure (contains all entries including conflict)
+        assert!(staging_dir.join("01_file1.txt").exists());
+        assert!(staging_dir.join("02_file2.txt").exists());
+        assert!(staging_dir.join("99_conflict.txt").exists());
+        assert!(staging_dir.join("99_conflict.txt/inside.txt").exists());
+    }
+
+    #[test]
+    fn test_atomic_publish_existing_files_alongside_new() {
+        // Test publishing new files alongside existing files in same directory
+        let config = create_test_config();
+        let manager = BuildManager::new(config).unwrap();
+
+        let sysroot = manager.sysroot_dir().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::create_dir_all(&sysroot).unwrap();
+
+        // Pre-populate sysroot with existing files
+        fs::create_dir_all(sysroot.join("usr/bin")).unwrap();
+        fs::write(sysroot.join("usr/bin/existing_tool"), "old tool").unwrap();
+
+        // Create staging with new files in same directory
+        fs::create_dir_all(staging_dir.join("usr/bin")).unwrap();
+        fs::write(staging_dir.join("usr/bin/new_tool"), "new tool").unwrap();
+        fs::write(staging_dir.join("usr/bin/another_tool"), "another tool").unwrap();
+
+        // Publish
+        manager.atomic_publish_to_sysroot(&staging_dir).unwrap();
+
+        // Verify existing file preserved
+        assert!(sysroot.join("usr/bin/existing_tool").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/bin/existing_tool")).unwrap(),
+            "old tool"
+        );
+
+        // Verify new files added
+        assert!(sysroot.join("usr/bin/new_tool").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/bin/new_tool")).unwrap(),
+            "new tool"
+        );
+        assert!(sysroot.join("usr/bin/another_tool").exists());
+        assert_eq!(
+            fs::read_to_string(sysroot.join("usr/bin/another_tool")).unwrap(),
+            "another tool"
+        );
+    }
+
+    #[test]
+    fn test_atomic_publish_preserves_staging_on_failure() {
+        // Test that staging directory is preserved on publication failure
+        let config = create_test_config();
+        let manager = BuildManager::new(config).unwrap();
+
+        let sysroot = manager.sysroot_dir().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::create_dir_all(&sysroot).unwrap();
+
+        // Pre-populate sysroot with a directory
+        fs::create_dir_all(sysroot.join("conflict")).unwrap();
+
+        // Staging has a file with same name
+        fs::write(staging_dir.join("conflict"), "file content").unwrap();
+        fs::write(staging_dir.join("other.txt"), "other content").unwrap();
+
+        // Publish - should fail
+        let result = manager.atomic_publish_to_sysroot(&staging_dir);
+        assert!(result.is_err());
+
+        // Verify staging is completely preserved
+        assert!(staging_dir.exists());
+        assert!(staging_dir.join("conflict").exists());
+        assert!(staging_dir.join("other.txt").exists());
+    }
+
+    #[test]
     fn test_build_failure_preserves_extracted_source() {
         // Regression test: build failure should NOT delete the extracted source directory.
         // The source directory (in config.directories.source) is persistent and should survive
@@ -4958,6 +5699,106 @@ install = [{ command = "echo", args = ["install"] }]
     }
 
     #[test]
+    fn test_build_preserves_source_cleanliness() {
+        // Regression test: successful build should NOT pollute the persistent source directory.
+        // Build artifacts (.o files, Makefile, binaries, etc.) should only appear in the build directory.
+        let temp_dir = tempdir().unwrap();
+        let source_dir = temp_dir.path().join("sources");
+        let build_dir = temp_dir.path().join("build");
+        let staging_dir = temp_dir.path().join("staging");
+
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        // Simulate extracted source in the persistent source directory
+        let extracted_source = source_dir.join("test-pkg-1.0");
+        fs::create_dir_all(&extracted_source).unwrap();
+        fs::write(
+            extracted_source.join("configure"),
+            "#!/bin/sh\necho configure",
+        )
+        .unwrap();
+        fs::write(extracted_source.join("Makefile.in"), "all:\n\t@echo make").unwrap();
+        fs::write(extracted_source.join("main.c"), "int main() { return 0; }").unwrap();
+        // Write cache marker
+        fs::write(
+            extracted_source.join(".extracted"),
+            "test-pkg\n1.0\n0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+
+        // Record original source files
+        let original_source_files: std::collections::HashSet<_> = fs::read_dir(&extracted_source)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+
+        // Create config and manager
+        let config = create_test_config();
+        let mut manager = BuildManager::new(config.clone()).unwrap();
+
+        // Create a simple in-tree recipe that would generate build artifacts
+        let mut recipe = create_test_recipe();
+        recipe.name = "test-pkg".to_string();
+        recipe.version = "1.0".to_string();
+        recipe.source = "test-source".to_string();
+        recipe.build_type = BuildType::InTree;
+        recipe.build = vec![BuildStep {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo 'build artifact' > built.txt && echo 'object' > main.o".to_string(),
+            ],
+            workdir: None,
+            env: HashMap::new(),
+            description: Some("Generate build artifacts".to_string()),
+            continue_on_failure: false,
+        }];
+        recipe.install = vec![];
+        manager.recipes.insert(recipe.name.clone(), recipe.clone());
+
+        // We need to set up the manager's source directory to point to our temp source_dir
+        // For this test, we'll directly test the copy_source_to_build_dir logic
+        let effective_source = manager
+            .copy_source_to_build_dir(&extracted_source, &build_dir.join("test-pkg-1.0"))
+            .unwrap();
+
+        // Verify effective source has the same files as original
+        let effective_source_files: std::collections::HashSet<_> = fs::read_dir(&effective_source)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(original_source_files, effective_source_files);
+
+        // Now simulate a build step that creates artifacts in the effective source (build_dir/src)
+        let build_step_workdir = &effective_source;
+        fs::write(build_step_workdir.join("built.txt"), "build artifact").unwrap();
+        fs::write(build_step_workdir.join("main.o"), "object file").unwrap();
+        fs::write(build_step_workdir.join("Makefile"), "generated makefile").unwrap();
+
+        // Verify original source directory is UNCHANGED (no build artifacts)
+        let source_files_after: std::collections::HashSet<_> = fs::read_dir(&extracted_source)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            original_source_files, source_files_after,
+            "Original source directory should be unchanged after build"
+        );
+
+        // Verify build artifacts exist only in effective source (build_dir/src)
+        assert!(effective_source.join("built.txt").exists());
+        assert!(effective_source.join("main.o").exists());
+        assert!(effective_source.join("Makefile").exists());
+
+        // Verify original source doesn't have build artifacts
+        assert!(!extracted_source.join("built.txt").exists());
+        assert!(!extracted_source.join("main.o").exists());
+        assert!(!extracted_source.join("Makefile").exists());
+    }
+
+    #[test]
     fn test_staging_dir_unique_per_build() {
         let config = create_test_config();
         let manager = BuildManager::new(config).unwrap();
@@ -4971,6 +5812,7 @@ install = [{ command = "echo", args = ["install"] }]
             install: vec![],
             env: HashMap::new(),
             workdir: None,
+            build_type: BuildType::InTree,
         };
 
         // Multiple calls should produce same staging dir name (deterministic)

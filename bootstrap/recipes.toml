@@ -62,8 +62,9 @@ name = "binutils"
 version = "2.43.1"
 source = "binutils"
 depends = ["zlib"]
+build_type = "out_of_tree"
 build = [
-  { command = "../configure", args = ["--prefix=/usr", "--with-sysroot", "--enable-gold=default", "--enable-ld=default", "--enable-plugins", "--enable-shared", "--disable-werror", "--enable-64-bit-bfd", "--with-system-zlib"], description = "Configure binutils", workdir = "build" },
+  { command = "../src/configure", args = ["--prefix=/usr", "--with-sysroot", "--enable-gold=default", "--enable-ld=default", "--enable-plugins", "--enable-shared", "--disable-werror", "--enable-64-bit-bfd", "--with-system-zlib"], description = "Configure binutils", workdir = "build" },
   { command = "make", args = ["tooldir=/usr"], description = "Build binutils", workdir = "build" },
 ]
 install = [
@@ -76,8 +77,9 @@ name = "gcc"
 version = "14.2.0"
 source = "gcc"
 depends = ["binutils", "zlib", "gmp", "mpfr", "mpc"]
+build_type = "out_of_tree"
 build = [
-  { command = "../configure", args = ["--prefix=/usr", "--disable-multilib", "--enable-languages=c,c++", "--with-system-zlib", "--enable-shared", "--enable-threads=posix", "--enable-__cxa_atexit", "--disable-libunwind-exceptions", "--enable-clocale=gnu", "--disable-libstdcxx-pch", "--with-default-libstdcxx-abi=new", "--enable-gnu-unique-object", "--enable-linker-build-id", "--enable-lto", "--enable-plugin", "--enable-install-libiberty", "--with-linker-hash-style=gnu", "--enable-gnu-indirect-function", "--disable-werror", "--enable-checking=release"], description = "Configure GCC", workdir = "build" },
+  { command = "../src/configure", args = ["--prefix=/usr", "--disable-multilib", "--enable-languages=c,c++", "--with-system-zlib", "--enable-shared", "--enable-threads=posix", "--enable-__cxa_atexit", "--disable-libunwind-exceptions", "--enable-clocale=gnu", "--disable-libstdcxx-pch", "--with-default-libstdcxx-abi=new", "--enable-gnu-unique-object", "--enable-linker-build-id", "--enable-lto", "--enable-plugin", "--enable-install-libiberty", "--with-linker-hash-style=gnu", "--enable-gnu-indirect-function", "--disable-werror", "--enable-checking=release"], description = "Configure GCC", workdir = "build" },
   { command = "make", args = [], description = "Build GCC", workdir = "build" },
   { command = "make", args = ["-k", "check"], description = "Test GCC", workdir = "build" },
 ]
@@ -137,14 +139,15 @@ name = "glibc"
 version = "2.40"
 source = "glibc"
 depends = ["gcc", "binutils", "linux-headers"]
+build_type = "out_of_tree"
 build = [
-  { command = "../configure", args = ["--prefix=/usr", "--disable-werror", "--enable-kernel=5.4", "--enable-stack-protector=strong", "--with-headers=/usr/include", "--enable-bind-now", "--disable-profile", "--enable-add-ons", "--enable-lock-elision"], description = "Configure glibc", workdir = "build" },
+  { command = "../src/configure", args = ["--prefix=/usr", "--disable-werror", "--enable-kernel=5.4", "--enable-stack-protector=strong", "--with-headers=/usr/include", "--enable-bind-now", "--disable-profile", "--enable-add-ons", "--enable-lock-elision"], description = "Configure glibc", workdir = "build" },
   { command = "make", args = [], description = "Build glibc", workdir = "build" },
 ]
 install = [
   { command = "make", args = ["install", "install_root=${DESTDIR}"], description = "Install glibc", workdir = "build" },
   { command = "mkdir", args = ["-p", "${DESTDIR}/etc"], description = "Create etc directory" },
-  { command = "cp", args = ["../nscd/nscd.conf", "${DESTDIR}/etc/nscd.conf"], description = "Install nscd config" },
+  { command = "cp", args = ["../src/nscd/nscd.conf", "${DESTDIR}/etc/nscd.conf"], description = "Install nscd config" },
   { command = "mkdir", args = ["-p", "${DESTDIR}/var/cache/nscd"], description = "Create nscd cache directory" },
 ]
 workdir = "."
